@@ -1,0 +1,22 @@
+spring:
+  docker:
+    compose:
+      # back-end/app 기준으로 저장소 루트의 Compose 파일을 사용합니다.
+      file: compose.yml
+      # 디버깅 종료 후에도 개발용 데이터 서비스를 유지합니다.
+      lifecycle-management: start-only
+  datasource:
+    # 로컬 기본값은 환경변수로 재정의할 수 있습니다.
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/bulk_ticket}
+    username: ${DB_USERNAME:bulk_ticket}
+    password: ${DB_PASSWORD:bulk_ticket_dev}
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  jpa:
+    hibernate:
+      # 테이블 생성은 Flyway가 담당합니다.
+      ddl-auto: validate
+  flyway:
+    enabled: true
