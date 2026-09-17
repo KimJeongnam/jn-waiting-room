@@ -1,0 +1,11 @@
+.home-page {
+  display: flex;
+  min-height: 100dvh;
+  align-items: center;
+  padding: 32px 16px;
+  background: var(--mantine-color-gray-0);
+}
+
+.home-card {
+  border: 1px solid var(--mantine-color-gray-2);
+}

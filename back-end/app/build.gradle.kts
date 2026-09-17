@@ -13,6 +13,14 @@ plugins {
     id("io.spring.dependency-management") version "1.1.7"
 }
 
+group = "org.jn"
+version = "0.0.1-SNAPSHOT"
+
+base {
+    // 배포 파일 이름은 프로젝트 디렉터리나 하위 모듈명과 분리합니다.
+    archivesName = "jn-waiting-room"
+}
+
 repositories {
     // Use Maven Central for resolving dependencies.
     mavenCentral()
@@ -47,7 +55,12 @@ java {
 
 application {
     // Define the main class for the application.
-    mainClass = "org.example.BulkTicketReservationApplication"
+    mainClass = "org.jn.waitingroom.WaitingRoomApplication"
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
+    // 버전과 관계없이 실행 파일 이름을 일정하게 유지합니다.
+    archiveFileName = "jn-waiting-room.jar"
 }
 
 tasks.named<Test>("test") {

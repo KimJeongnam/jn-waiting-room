@@ -1,4 +1,6 @@
 spring:
+  application:
+    name: jn-waiting-room
   docker:
     compose:
       # back-end/app 기준으로 저장소 루트의 Compose 파일을 사용합니다.
