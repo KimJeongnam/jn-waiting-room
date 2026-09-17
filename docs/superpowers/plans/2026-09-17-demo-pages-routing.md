@@ -16,6 +16,7 @@
 - 개발 서버에서는 데모 페이지를 자동 활성화하고, 데모 production build는 `VITE_ENABLE_DEMO_PAGES=true`로 명시적으로 활성화한다.
 - API 호출, heartbeat, polling, 입장 완료 자동 전환, 인증은 구현하지 않는다.
 - 기존 `HomePage`와 `WaitingRoomPage`의 화면 내용은 변경하지 않는다.
+- TDD는 예매 신청 버튼의 `/waiting` 이동과 데모 라우트 노출 차단처럼 동작 회귀 위험이 있는 로직에만 적용한다. 정적 마크업과 빌드 설정에는 형식적인 테스트를 추가하지 않는다.
 - 현재 checkout의 기존 미커밋 변경과 LF 개행을 보존한다.
 
 ---
