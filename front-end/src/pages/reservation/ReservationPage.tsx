@@ -9,7 +9,7 @@ export function ReservationPage() {
 
   return (
     <main className="reservation-page">
-      <Center h="100%">
+      <Center mih="100vh">
         <Button onClick={() => navigate('/waiting')} size="lg">
           예매 신청
         </Button>
