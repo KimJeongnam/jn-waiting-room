@@ -15,7 +15,8 @@
     "@mantine/core": "^9.6.1",
     "@mantine/hooks": "^9.6.1",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "react-router": "^8.4.0"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^7.0.1",
