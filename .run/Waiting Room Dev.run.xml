@@ -1,0 +1,7 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Waiting Room Dev" type="CompoundRunConfigurationType">
+    <toRun name="Backend Debug" type="SpringBootApplicationConfigurationType" />
+    <toRun name="Frontend Dev" type="GradleRunConfiguration" />
+    <method v="2" />
+  </configuration>
+</component>

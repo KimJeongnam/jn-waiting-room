@@ -1,0 +1,14 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Backend Debug" type="SpringBootApplicationConfigurationType" factoryName="Spring Boot">
+    <option name="ENABLE_JMX_AUTH" value="true" />
+    <envs>
+      <env name="SERVER_ADDRESS" value="127.0.0.1" />
+      <env name="SERVER_PORT" value="8080" />
+    </envs>
+    <module name="jn-waiting-room.app.main" />
+    <option name="SPRING_BOOT_MAIN_CLASS" value="org.jn.waitingroom.WaitingRoomApplication" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>

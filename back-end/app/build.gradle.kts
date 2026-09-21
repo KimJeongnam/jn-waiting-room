@@ -67,3 +67,10 @@ tasks.named<Test>("test") {
     // Use JUnit Platform for unit tests.
     useJUnitPlatform()
 }
+
+tasks.register<Exec>("frontendDev") {
+    group = "application"
+    description = "Runs the Vite development server in WSL."
+    workingDir(rootProject.projectDir.resolve("../front-end"))
+    commandLine("bash", "-lc", ". ~/.nvm/nvm.sh && nvm use && pnpm dev")
+}
