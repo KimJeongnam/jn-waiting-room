@@ -1,6 +1,6 @@
 # Waiting Room 핵심 기능 구조
 
-- 상태: 구현 대상 확정 설계(Backend 핵심 기능은 아직 미구현)
+- 상태: 핵심 대기·입장·완료 흐름 구현 완료, Waiting token·세션 보안과 운영 복구 기능은 후속 적용
 - 대상: 서비스 A와 Waiting Room 개발자
 - 범위: 대기 등록, Waiting 세션, 상태 Polling, 동시 이용자 수 기반 입장, 서비스 완료에 따른 슬롯 반환
 - 핵심 원칙: 하나의 요청은 전체 업무 흐름에서 `reservationRequestId` 하나로 식별한다.
@@ -159,6 +159,24 @@ Member reservationRequestId
 - `ADMITTED → ENTERED` 시 score를 `now + maxSessionDuration`으로 갱신한다.
 - 정상 완료, 취소 또는 만료 시 제거한다.
 - 가용 슬롯은 `max(0, maxConcurrentUsers - ZCARD(active-slots:{serviceId}))`로 계산한다.
+
+#### 5.3.1 예상 대기시간용 슬롯 반환 이력
+
+```text
+Key    slot-release-events:{serviceId}
+Type   Sorted Set
+Score  slotReleasedAt의 Unix epoch milliseconds
+Member reservationRequestId
+TTL    etaWindow의 2배
+```
+
+- 예상 대기시간은 서비스 이용 완료시간이 아니라 현재 요청이 `ADMITTED`가 될 때까지의 시간이다. 유지보수 batch 제한과 다음 Scheduler 보정 실행까지의 지연도 포함한다.
+- 정상 완료, `SESSION_TIMEOUT`, `ADMISSION_TIMEOUT`, `ADMITTED` 취소와 고아 활성 슬롯 정리에서 `active-slots` member가 실제로 제거된 경우만 반환 이벤트로 기록한다.
+- 각 상태 변경 Lua는 `ZREM active-slots`의 결과가 `1`일 때만 같은 원자 처리 안에서 `ZADD slot-release-events`를 실행한다. 중복 완료나 이미 제거된 슬롯은 표본을 추가하지 않는다.
+- `nowMs`는 각 Lua가 Redis `TIME`으로 얻은 millisecond 값이다. 최근 표본 범위는 `[nowMs - etaWindowMs, nowMs]`로 양 끝을 포함하고, 정리 시 cutoff보다 작은 score만 제거한다.
+- 이벤트 기록 시 오래된 member를 제거하고 Key TTL을 `etaWindow * 2`로 갱신한다. Polling은 TTL을 갱신하지 않으므로 새 반환이 없으면 마지막 기록 후 자연 만료된다.
+- Key는 다른 서비스 상태와 같은 `{serviceId}` hash tag를 사용한다. 각 Lua가 접근하는 모든 Key는 호출자가 `KEYS[]`로 전달하며 Lua 내부에서 Key 이름을 조합하지 않는다.
+- Lua는 명령 사이의 interleaving을 막지만 runtime 오류 시 이전 쓰기를 rollback하지 않는다. 첫 쓰기 전에 Key type과 입력값을 검증하고 반환 이력 명령은 `redis.pcall`로 실행한다. `ZADD`, 오래된 표본 정리 또는 TTL 갱신 중 하나라도 실패하면 같은 script가 `slot-release-events` Key를 삭제해 이후 ETA를 `null`로 낮추고 오류를 경보한다. 파생 지표 이력 삭제에 성공한 경우만 일반 write gate 차단의 예외로 핵심 상태 전이를 유지하며, 이력 삭제도 실패하면 일반 쓰기 오류 규칙에 따라 write gate를 차단한다.
 
 ### 5.4 요청 상태
 
@@ -440,8 +458,8 @@ token 소비는 요청의 `serviceId`와 token hash로 Key를 찾은 뒤, 저장
 Scheduler와 Pub/Sub Subscriber는 서비스별 유지보수 lease를 획득한 뒤 같은 Lua script를 호출한다. 한 번의 실행은 후보를 최대 `maxCandidatesScannedPerRun`개만 조회하고, 활성 슬롯 만료·고아 정리 최대 `maxActiveExpirationsPerRun`개, 대기 만료·고아 정리 최대 `maxWaitingExpirationsPerRun`개와 입장 최대 `maxAdmissionsPerRun`개만 처리한다. 각 batch는 요청 단위로 계산하며 하나의 요청에서 여러 ZSET member를 제거해도 1건이다. 활성 슬롯 정리와 대기 정리에 별도 예산을 보장해 한 종류의 적체가 다른 종류를 계속 굶기지 않게 한다.
 
 1. Redis `TIME`으로 현재 시각을 구한다.
-2. 만료된 활성 슬롯을 최대 `maxActiveExpirationsPerRun`개 처리한다. 기존 상태가 `ADMITTED` 또는 미완료 `ENTERED`이면 상태를 `EXPIRED`로 바꾸고 `expiredAt`과 각각 `ADMISSION_TIMEOUT`, `SESSION_TIMEOUT`을 기록한 뒤 슬롯을 제거하고 `slot-released`를 발행한다.
-3. 만료된 활성 슬롯의 상태 Key가 없거나 상태가 더 이상 미완료 `ADMITTED`·`ENTERED`가 아니면 고아 member로 제거하고 `slot-released`를 발행한다. 상태 JSON이 손상됐으면 원문을 격리 Key에 보관하고 최소한의 `EXPIRED`, `STATE_CORRUPTED` 상태로 교체한 뒤 슬롯을 제거한다. 만료시각 전의 손상된 활성 슬롯은 실제 이용 중일 수 있으므로 score 만료 전에는 제거하지 않는다.
+2. 만료된 활성 슬롯을 최대 `maxActiveExpirationsPerRun`개 처리한다. 기존 상태가 `ADMITTED` 또는 미완료 `ENTERED`이면 상태를 `EXPIRED`로 바꾸고 `expiredAt`과 각각 `ADMISSION_TIMEOUT`, `SESSION_TIMEOUT`을 기록한 뒤 슬롯을 제거한다. 실제 제거됐으면 슬롯 반환 이력을 기록하고 `slot-released`를 발행한다.
+3. 만료된 활성 슬롯의 상태 Key가 없거나 상태가 더 이상 미완료 `ADMITTED`·`ENTERED`가 아니면 고아 member로 제거한다. 실제 제거됐으면 슬롯 반환 이력을 기록하고 `slot-released`를 발행한다. 상태 JSON이 손상됐으면 원문을 격리 Key에 보관하고 최소한의 `EXPIRED`, `STATE_CORRUPTED` 상태로 교체한 뒤 슬롯을 제거한다. 만료시각 전의 손상된 활성 슬롯은 실제 이용 중일 수 있으므로 score 만료 전에는 제거하지 않는다.
 4. `maxWaitDuration`을 넘은 `WAITING` 요청과, 복구 barrier가 지난 뒤 heartbeat timeout을 넘은 `WAITING` 요청을 최대 `maxWaitingExpirationsPerRun`개 처리한다. heartbeat 후보의 대기 ZSET membership도 먼저 확인해 하나라도 없으면 남은 member를 제거하고 `EXPIRED`, `INTERNAL_INCONSISTENCY`로 종료한다. 두 member가 정상이면 각각 `MAX_WAIT_DURATION`, `HEARTBEAT_TIMEOUT`을 기록한다.
 5. 상태 Key가 없거나 더 이상 `WAITING`이 아닌 고아 대기·heartbeat member를 같은 대기 정리 batch 범위에서 제거한다. `WAITING` 상태 JSON이 손상됐으면 원문을 격리 Key에 보관하고 최소한의 `EXPIRED`, `STATE_CORRUPTED` 상태로 교체한 뒤 대기·heartbeat member를 제거한다.
 6. `activeCount`와 `maxConcurrentUsers`로 가용 슬롯을 계산한다.
@@ -467,14 +485,14 @@ Scheduler와 Pub/Sub Subscriber는 서비스별 유지보수 lease를 획득한 
 
 ### 8.5 완료와 취소
 
-정상 완료 Lua script는 `completedAt` 기록, 활성 슬롯 제거와 `PUBLISH`를 한 번에 수행한다. 슬롯을 실제로 제거한 경우에만 `slot-released`를 발행한다.
+정상 완료 Lua script는 `completedAt` 기록, 활성 슬롯 제거, 슬롯 반환 이력 기록과 `PUBLISH`를 한 번에 수행한다. 슬롯을 실제로 제거한 경우에만 반환 이력을 기록하고 `slot-released`를 발행한다.
 
 - 최초 완료: 슬롯을 제거하고 성공을 반환한다.
 - 중복 완료: 저장된 완료 결과를 반환한다.
 - `enteredAt`이 있고 세션이 이미 만료된 완료: `completedAt`을 기록하고 슬롯이 반환됐음을 나타내는 멱등 성공을 반환한다.
 - 한 번도 `ENTERED`가 아니었던 요청: `409 Conflict`를 반환한다.
 
-취소는 `WAITING`과 `ADMITTED`에서만 허용한다. `ADMITTED` 취소는 활성 슬롯을 제거하고 `slot-released`를 발행한다. `ENTERED` 이후에는 완료 API를 사용한다.
+취소는 `WAITING`과 `ADMITTED`에서만 허용한다. `ADMITTED` 취소는 활성 슬롯을 제거하고, 실제 제거됐으면 반환 이력을 기록한 뒤 `slot-released`를 발행한다. `ENTERED` 이후에는 완료 API를 사용한다.
 
 ## 9. Polling 정책
 
@@ -510,7 +528,39 @@ Retry-After = max(
 
 기본 정책은 Browser가 모바일 앱 전환이나 백그라운드 timer 제한을 겪어도 20분 동안 대기를 유지하는 것이다. 이 시간 동안 이탈 요청이 대기 순번에 남을 수 있지만 활성 슬롯은 점유하지 않는다. Front가 다시 보이면 즉시 Polling해 heartbeat와 화면 상태를 회복한다.
 
-예상 대기시간은 현재 순번과 최근 슬롯 반환 속도로 계산한다. 관측된 반환 속도가 없으면 `estimatedWaitSeconds`를 `null`로 반환하고 15초 주기를 사용한다. 구체적인 예측 알고리즘은 운영 데이터가 쌓인 뒤 확정한다.
+### 9.1 예상 대기시간
+
+예상 대기시간은 현재 순번이 가용 슬롯 범위에 들어가거나 최근 슬롯 반환 속도만큼 슬롯이 추가로 반환되어 `ADMITTED`가 될 때까지의 추정값이다. Polling Lua는 순번, 활성 슬롯 수와 최근 반환 표본을 같은 Redis 시각 기준으로 읽어 다음 값을 계산한다.
+
+```text
+availableSlots = max(0, maxConcurrentUsers - activeSlotCount)
+requiredReleases = max(0, position - availableSlots)
+rawBatchDelaySeconds =
+  ceil(position / maxAdmissionsPerRun) * schedulerIntervalSeconds
+observationSeconds = max(
+  etaMinObservationSeconds,
+  min(etaWindowSeconds, now - oldestSampleAt)
+)
+releaseRatePerSecond = releaseSampleCount / observationSeconds
+fallbackReleaseRatePerSecond = etaInitialReleaseRatePerSecond
+effectiveReleaseRatePerSecond =
+  releaseSampleCount >= etaMinSamples
+    ? releaseRatePerSecond
+    : fallbackReleaseRatePerSecond
+rawReleaseDelaySeconds = requiredReleases / effectiveReleaseRatePerSecond
+estimatedWaitSeconds =
+  ceil(max(rawBatchDelaySeconds, rawReleaseDelaySeconds))
+```
+
+`position`은 1부터 시작한다. 현재 가용 슬롯 범위라도 유지보수 batch를 거쳐야 하므로 `WAITING` 응답에서 `0`초를 반환하지 않는다. `requiredReleases=0`이면 `rawReleaseDelaySeconds=0`으로 두고 반환 표본 없이 batch 지연을 사용한다. 추가 슬롯 반환이 필요한데 최근 `etaWindow` 안의 표본이 `etaMinSamples`보다 적으면 `etaInitialReleaseRatePerSecond`가 양수일 때 그 값을 fallback 반환률로 사용한다. fallback이 0이면 `estimatedWaitSeconds=null`과 15초 주기를 반환한다. 충분한 표본이 있으면 기존처럼 실측 반환률로 전환한다. batch 지연과 반환 지연 중 큰 값을 선택한 뒤 최종 초 단위 값만 올림해 1초·10초·15초 Polling 구간을 선택한다.
+
+표본 범위는 millisecond 기준 `[nowMs - etaWindowMs, nowMs]`이며, 관측시간은 millisecond 차이를 실수 초로 변환한다. 최종 ETA에서만 `ceil`한다. 최소 표본과 양수 관측시간이 있으면 반환률은 양수여야 하며, 0 또는 비정상 값은 손상 방어 경로로 `null` 처리한다. 예상시간, `nextPollAfterMs`와 세션의 `nextPollAllowedAt`은 하나의 Polling Lua에서 결정해 서로 다른 시점의 대기열 상태가 섞이지 않게 한다.
+
+이 값은 최근 처리 추세 또는 초기 반환률에 기반한 추정치이며 입장 시각을 보장하지 않는다. 서비스 이용 패턴이 급변하면 관측 구간 동안 오차가 남을 수 있다. Redis 재시작 또는 이력 Key 만료 후에는 최소 표본이 다시 쌓일 때까지 초기 반환률을 사용하며, 초기 반환률이 0이면 `null`로 안전하게 복귀한다.
+
+### 9.2 대기 진행률
+
+Waiting Front는 현재 페이지에서 처음 받은 유효한 `position`을 최초 순번으로 보관한다. 진행률은 `(최초 순번 - 현재 순번) / 최초 순번 * 100`으로 계산하고 0~100 범위로 제한한다. 전체 대기 인원과 현재 순번이 함께 감소하는 구조에서 진행률이 계속 0%로 보이는 문제를 피하기 위한 표시 전용 값이며, 새로고침하면 새 최초 순번을 기준으로 다시 시작한다.
 
 ## 10. 외부 HTTP API
 
@@ -592,6 +642,8 @@ X-Waiting-Request: 1
   "nextPollAfterMs": 10000
 }
 ```
+
+`estimatedWaitSeconds`는 `ADMITTED`까지의 추정 초 단위 시간이다. 현재 가용 슬롯 범위이면 유지보수 batch 지연을 반환하고, 추가 슬롯 반환이 필요한데 최근 표본이 부족하면 `null`이다. Waiting Front는 값을 자체 재계산하지 않고 서버 응답을 표시한다.
 
 입장 허용 시 등록된 redirect target으로 URL을 생성한다.
 
@@ -680,14 +732,14 @@ Authorization: ApiKey {keyId}.{secret}
 
 ```yaml
 waiting-room:
-  heartbeat-timeout: ${WAITING_ROOM_HEARTBEAT_TIMEOUT:PT20M}
-  admission-timeout: ${WAITING_ROOM_ADMISSION_TIMEOUT:PT2M}
-  max-session-duration: ${WAITING_ROOM_MAX_SESSION_DURATION:PT30M}
+  demo:
+    seed-enabled: ${WAITING_ROOM_DEMO_SEED_ENABLED:false}
+    service-id: ${WAITING_ROOM_DEMO_SERVICE_ID:reservation-service}
+    active-users: ${WAITING_ROOM_DEMO_ACTIVE_USERS:0}
+    waiting-users: ${WAITING_ROOM_DEMO_WAITING_USERS:0}
+    active-expiry-min: ${WAITING_ROOM_DEMO_ACTIVE_EXPIRY_MIN:PT30S}
+    active-expiry-max: ${WAITING_ROOM_DEMO_ACTIVE_EXPIRY_MAX:PT2M30S}
   scheduler-interval: ${WAITING_ROOM_SCHEDULER_INTERVAL:PT1S}
-  request-ttl: ${WAITING_ROOM_REQUEST_TTL:PT24H}
-  waiting-token-ttl: ${WAITING_ROOM_TOKEN_TTL:PT5M}
-  max-wait-duration: ${WAITING_ROOM_MAX_WAIT_DURATION:PT23H}
-  cleanup-margin: ${WAITING_ROOM_CLEANUP_MARGIN:PT10M}
   max-retry-after: ${WAITING_ROOM_MAX_RETRY_AFTER:PT30S}
   retry-after-safety-margin: ${WAITING_ROOM_RETRY_AFTER_SAFETY_MARGIN:PT1S}
   heartbeat-expiration-recovery-grace: ${WAITING_ROOM_HEARTBEAT_EXPIRATION_RECOVERY_GRACE:PT20M}
@@ -701,11 +753,30 @@ waiting-room:
   services:
     reservation-service:
       max-concurrent-users: ${WAITING_ROOM_RESERVATION_MAX_CONCURRENT_USERS}
+      heartbeat-timeout: ${WAITING_ROOM_RESERVATION_HEARTBEAT_TIMEOUT:PT20M}
+      admission-timeout: ${WAITING_ROOM_RESERVATION_ADMISSION_TIMEOUT:PT2M}
+      max-session-duration: ${WAITING_ROOM_RESERVATION_MAX_SESSION_DURATION:PT30M}
+      eta-window: ${WAITING_ROOM_RESERVATION_ETA_WINDOW:PT5M}
+      eta-min-samples: ${WAITING_ROOM_RESERVATION_ETA_MIN_SAMPLES:10}
+      eta-min-observation: ${WAITING_ROOM_RESERVATION_ETA_MIN_OBSERVATION:PT1M}
+      eta-initial-release-rate-per-second: ${WAITING_ROOM_RESERVATION_ETA_INITIAL_RELEASE_RATE_PER_SECOND:0}
+      request-ttl: ${WAITING_ROOM_RESERVATION_REQUEST_TTL:PT24H}
+      waiting-token-ttl: ${WAITING_ROOM_RESERVATION_TOKEN_TTL:PT5M}
+      max-wait-duration: ${WAITING_ROOM_RESERVATION_MAX_WAIT_DURATION:PT23H}
+      cleanup-margin: ${WAITING_ROOM_RESERVATION_CLEANUP_MARGIN:PT10M}
       redirects:
         service-entry: ${WAITING_ROOM_RESERVATION_ENTRY_URL}
 ```
 
-애플리케이션은 시작 시 다음 조건을 검증하고 위반하면 기동을 실패한다.
+`waiting-room.demo`는 개발·데모 데이터 전용이다. `demo` Spring profile과 `seed-enabled=true`가 함께 지정된 경우에만 최초 활성 테스트 사용자와 대기 테스트 사용자를 생성한다. 기본값은 비활성이므로 운영 실행에는 테스트 데이터가 생성되지 않는다.
+
+IntelliJ 데모 실행은 서비스 수용량 5,000명, 최초 활성 테스트 사용자 5,000명, 최초 대기 테스트 사용자 10,000명으로 구성한다. 최초 활성 테스트 슬롯에만 현재 시각부터 30~150초 사이의 무작위 만료시간을 지정한다. 한 주기 최대 입장 수는 60명, 입장 확인 제한은 60초, 초기 반환률은 초당 55.6명으로 두어 새 신청자가 약 3분 동안 완만한 대기 인원 감소를 관찰하도록 한다. 실제 브라우저 요청과 이후 입장자는 서비스의 `admission-timeout`과 `max-session-duration`을 그대로 사용한다.
+
+상태조회 시 Redis는 현재 활성 슬롯 수와 대기 순번을 원자적으로 비교한다. 가용 슬롯 범위에서는 반환 표본 없이 유지보수 batch 지연을 계산하고, 그 예상 대기시간 구간에 따라 Polling 주기를 선택한다. 추가 슬롯 반환이 필요한 요청은 최근 반환률까지 반영한다.
+
+`etaWindow`, `etaMinSamples`, `etaMinObservation`, `etaInitialReleaseRatePerSecond`는 서비스별 이용 패턴에 따라 조정한다. `etaWindow`와 `etaMinObservation`은 양수이고 `etaMinObservation <= etaWindow`, `etaMinSamples >= 1`이어야 한다. 초기 반환률은 0 이상의 유한한 값이어야 하며 운영 기본값 0은 fallback 비활성화를 뜻한다. 기본 실측 조건은 최근 5분 동안 최소 10개 반환 표본과 최소 1분 관측시간이다. IntelliJ 데모는 조기 실측 전환으로 ETA가 크게 흔들리지 않도록 최소 표본을 5,000개로 덮어쓴다.
+
+애플리케이션은 시작 시 서비스별로 다음 조건을 검증하고 위반하면 기동을 실패한다.
 
 ```text
 requestTtl >
@@ -717,12 +788,12 @@ requestTtl >
 
 다음 조건도 함께 검증한다.
 
-- `maxRetryAfter < heartbeatTimeout`
-- `0 < retryAfterSafetyMargin < heartbeatTimeout`
-- `heartbeatExpirationRecoveryGrace >= heartbeatTimeout`
+- `maxRetryAfter <` 모든 서비스의 `heartbeatTimeout`
+- `0 < retryAfterSafetyMargin <` 모든 서비스의 `heartbeatTimeout`
+- `heartbeatExpirationRecoveryGrace >=` 모든 서비스의 `heartbeatTimeout`
 - `maintenanceHealthTimeout >= max(schedulerInterval * 3, maintenanceLeaseTimeout * 2)`
 - `maintenanceLeaseTimeout > schedulerInterval`
-- `schedulerInterval < admissionTimeout`
+- `schedulerInterval <` 모든 서비스의 `admissionTimeout`
 - `maxCandidatesScannedPerRun >= maxAdmissionsPerRun`
 - 모든 batch와 시간 설정은 0보다 큼
 - 서비스별 `maxConcurrentUsers`는 1 이상
@@ -765,7 +836,8 @@ requestTtl >
 | 상태별 요청 수 | 상태 전이 추이 확인 |
 | Redis 메모리 사용량과 OOM 오류 | `noeviction` 환경의 등록 실패 사전 감지 |
 | `STATE_CORRUPTED` 발생 수와 격리 Key 수 | 데이터 손상 즉시 탐지와 수동 원인 분석 |
-| 슬롯 반환률 | 예상 대기시간 계산 근거 |
+| 최근 슬롯 반환 표본 수·관측시간·반환률 | 예상 대기시간 계산 근거와 표본 부족 확인 |
+| 예상 대기시간의 실제 입장시간 대비 오차 | 관측 구간과 최소 표본 수 조정 |
 | Lua 실행시간, 조회 후보 수와 batch 처리량 | Redis 장시간 점유 방지 |
 | Scheduler·Subscriber 성공과 실패 | 즉시 처리와 보정 동작 확인 |
 | 대기 정리 batch 소진 횟수와 최장 cleanup backlog 시간 | 무효 후보 적체로 인한 입장 지연 확인 |
@@ -775,13 +847,36 @@ requestTtl >
 
 ## 14. 초기 구현 범위와 완료 기준
 
-초기 구현에 포함한다.
+### 14.1 현재 구현 상태
+
+현재 코드에는 다음 핵심 기능이 구현되어 있다.
+
+- `reservationRequestId` 기반 멱등 등록과 payload 충돌 검사
+- 대기·heartbeat·활성 슬롯 Sorted Set과 요청 상태 TTL
+- 5개 상태, 서비스별 동시 수용량, 입장·완료·취소 API
+- 적응형 Polling, heartbeat, 조기 Polling rate limit
+- Scheduler와 Redis Pub/Sub을 이용한 만료 정리와 슬롯 보충
+- 서비스별 유지보수 lease와 제한된 후보·변경 batch
+- 고아 membership 정리와 손상 상태 격리
+
+다음 항목은 확정 설계에는 포함되지만 현재 핵심 구현 범위에서는 후속 단계다.
+
+- 일회용 `waitingToken`, Waiting 세션 쿠키와 한 Browser 한 세션 제약
+- 서비스 Backend 인증과 요청 소유권 검증
+- Redis 연결 복구 barrier와 readiness gate
+- 운영 Redis `noeviction`, OOM 변경 gate와 break-glass 복구 도구
+- 운영 지표, 경보와 감사 로그
+
+### 14.2 확정 설계 범위
+
+초기 운영용 확정 설계에는 다음을 포함한다.
 
 - `reservationRequestId` 기반 멱등 대기 등록과 payload 충돌 검사
 - 일회용 `waitingToken`과 세션 쿠키
 - 대기·heartbeat·활성 슬롯 Sorted Set
 - 요청 상태 Key와 TTL 불변조건 검증
 - 적응형 Polling과 heartbeat
+- 최근 슬롯 반환 이력, 최소 표본 fallback과 batch 제한을 반영한 예상 대기시간
 - 5개 상태와 서비스별 동시 수용량
 - 조회 후보와 변경 batch가 제한된 Lua 입장·만료 처리
 - 입장·완료·취소 HTTP API와 오류 계약
@@ -798,7 +893,9 @@ requestTtl >
 - Redis 데이터 유실 복구
 - Redis Cluster 배포
 
-완료 기준은 다음과 같다.
+### 14.3 최종 완료 기준
+
+확정 설계의 최종 완료 기준은 다음과 같다. 현재 구현 여부는 14.1의 구분을 따른다.
 
 1. 동일 ID와 payload 재등록은 대기 member와 token을 변경하지 않고 현재 상태만 반환한다.
 2. 동일 ID의 다른 payload는 `409`로 거부된다.
@@ -821,3 +918,5 @@ requestTtl >
 19. `WAITING` 상태와 ZSET member가 불일치하면 재시도 루프 대신 명시적인 종료 상태가 된다.
 20. 운영 Redis는 Key를 eviction하지 않으며, 예상 밖 OOM이 발생하면 서비스 변경 gate가 내려가 모든 AP·Scheduler·Subscriber가 쓰기를 중단한다.
 21. 영향 ID를 알 수 없으면 해당 서비스 전체 정합성을 검사하고, 단일 복구 소유자의 검증이 끝나기 전에는 변경 gate를 다시 열지 않는다.
+22. `WAITING` 응답은 같은 Redis 시각의 순번·활성 슬롯·최근 반환 표본으로 ETA를 계산하며, 추가 슬롯 반환이 필요한데 최소 표본이 부족하면 `null`을 반환한다.
+23. 예상 대기시간은 유지보수 batch 지연과 슬롯 반환 지연을 함께 반영하고, 계산된 구간에 따라 `nextPollAfterMs`를 결정한다.

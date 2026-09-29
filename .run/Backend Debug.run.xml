@@ -4,6 +4,18 @@
     <envs>
       <env name="SERVER_ADDRESS" value="127.0.0.1" />
       <env name="SERVER_PORT" value="8080" />
+      <env name="SPRING_PROFILES_ACTIVE" value="demo" />
+      <env name="WAITING_ROOM_DEMO_ACTIVE_EXPIRY_MAX" value="PT2M30S" />
+      <env name="WAITING_ROOM_DEMO_ACTIVE_EXPIRY_MIN" value="PT30S" />
+      <env name="WAITING_ROOM_DEMO_ACTIVE_USERS" value="5000" />
+      <env name="WAITING_ROOM_DEMO_SEED_ENABLED" value="true" />
+      <env name="WAITING_ROOM_DEMO_WAITING_USERS" value="10000" />
+      <env name="WAITING_ROOM_MAX_ADMISSIONS_PER_RUN" value="60" />
+      <env name="WAITING_ROOM_RESERVATION_ADMISSION_TIMEOUT" value="PT1M" />
+      <env name="WAITING_ROOM_RESERVATION_ETA_INITIAL_RELEASE_RATE_PER_SECOND" value="55.6" />
+      <env name="WAITING_ROOM_RESERVATION_ETA_MIN_SAMPLES" value="5000" />
+      <env name="WAITING_ROOM_RESERVATION_MAX_CONCURRENT_USERS" value="5000" />
+      <env name="WAITING_ROOM_RESERVATION_ENTRY_URL" value="http://localhost:5173/demo/admitted" />
     </envs>
     <module name="jn-waiting-room.app.main" />
     <option name="SPRING_BOOT_MAIN_CLASS" value="org.jn.waitingroom.WaitingRoomApplication" />

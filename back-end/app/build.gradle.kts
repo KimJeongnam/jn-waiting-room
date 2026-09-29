@@ -40,6 +40,9 @@ dependencies {
 
     // Use JUnit Jupiter for testing.
     testImplementation(libs.junit.jupiter)
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    // 원자 처리 테스트는 mock 대신 실제 Redis 컨테이너에서 실행합니다.
+    testImplementation("org.testcontainers:testcontainers-junit-jupiter:2.0.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 
     // This dependency is used by the application.

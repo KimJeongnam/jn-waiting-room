@@ -1,3 +1,8 @@
+# @author jeongnam
+# @since 2026-09-21
+# @file application.yml
+# @description Spring Boot와 Waiting Room의 실행 설정을 정의합니다.
+
 spring:
   application:
     name: jn-waiting-room
@@ -22,3 +27,61 @@ spring:
       ddl-auto: validate
   flyway:
     enabled: true
+
+waiting-room:
+  demo:
+    # 운영 실행에서는 false이며 demo 프로필과 함께 명시적으로 활성화해야 합니다.
+    seed-enabled: ${WAITING_ROOM_DEMO_SEED_ENABLED:false}
+    # 테스트 사용자를 생성할 대상 서비스입니다.
+    service-id: ${WAITING_ROOM_DEMO_SERVICE_ID:reservation-service}
+    # 최초 활성 슬롯을 점유할 테스트 사용자 수입니다.
+    active-users: ${WAITING_ROOM_DEMO_ACTIVE_USERS:0}
+    # 최초 대기열에 등록할 테스트 사용자 수입니다.
+    waiting-users: ${WAITING_ROOM_DEMO_WAITING_USERS:0}
+    # 최초 활성 테스트 사용자에게만 적용할 개별 슬롯 만료시간 범위입니다.
+    active-expiry-min: ${WAITING_ROOM_DEMO_ACTIVE_EXPIRY_MIN:PT30S}
+    active-expiry-max: ${WAITING_ROOM_DEMO_ACTIVE_EXPIRY_MAX:PT2M30S}
+  # 모든 대상 서비스의 입장·만료 처리를 확인하는 주기입니다.
+  scheduler-interval: ${WAITING_ROOM_SCHEDULER_INTERVAL:PT1S}
+  # 429 또는 503 응답에서 안내할 수 있는 최대 재시도 대기시간입니다.
+  max-retry-after: ${WAITING_ROOM_MAX_RETRY_AFTER:PT30S}
+  # 재시도 전에 heartbeat 만료를 판단하기 위한 안전 여유시간입니다.
+  retry-after-safety-margin: ${WAITING_ROOM_RETRY_AFTER_SAFETY_MARGIN:PT1S}
+  # 손상된 요청 원문을 운영 확인용 격리 Key에 보관하는 시간입니다.
+  quarantine-ttl: ${WAITING_ROOM_QUARANTINE_TTL:PT1H}
+  # 여러 인스턴스의 동일 서비스 유지보수 실행을 막는 lease 유지시간입니다.
+  maintenance-lease-timeout: ${WAITING_ROOM_MAINTENANCE_LEASE_TIMEOUT:PT5S}
+  # 한 번의 유지보수 실행에서 허용할 최대 입장 수입니다.
+  max-admissions-per-run: ${WAITING_ROOM_MAX_ADMISSIONS_PER_RUN:100}
+  # 한 번에 정리할 최대 활성 슬롯 수입니다.
+  max-active-expirations-per-run: ${WAITING_ROOM_MAX_ACTIVE_EXPIRATIONS_PER_RUN:100}
+  # 한 번에 정리할 최대 대기 요청 수입니다.
+  max-waiting-expirations-per-run: ${WAITING_ROOM_MAX_WAITING_EXPIRATIONS_PER_RUN:100}
+  # 한 번에 검사할 최대 요청 후보 수입니다.
+  max-candidates-scanned-per-run: ${WAITING_ROOM_MAX_CANDIDATES_SCANNED_PER_RUN:300}
+  services:
+    # 범용 Waiting Room이 보호하는 대상 서비스의 고유 ID입니다.
+    reservation-service:
+      # 서비스가 동시에 수용할 수 있는 최대 활성 사용자 수입니다.
+      max-concurrent-users: ${WAITING_ROOM_RESERVATION_MAX_CONCURRENT_USERS}
+      # 마지막 상태 조회 후 대기 요청을 유지하는 최대 시간입니다.
+      heartbeat-timeout: ${WAITING_ROOM_RESERVATION_HEARTBEAT_TIMEOUT:PT20M}
+      # 입장 허용 후 실제 입장 확인까지 기다리는 최대 시간입니다.
+      admission-timeout: ${WAITING_ROOM_RESERVATION_ADMISSION_TIMEOUT:PT2M}
+      # 입장 확인 후 활성 슬롯을 점유할 수 있는 최대 이용시간입니다.
+      max-session-duration: ${WAITING_ROOM_RESERVATION_MAX_SESSION_DURATION:PT30M}
+      # 예상 대기시간 계산에 사용할 최근 슬롯 반환 표본 구간입니다.
+      eta-window: ${WAITING_ROOM_RESERVATION_ETA_WINDOW:PT5M}
+      # 슬롯 반환률 계산에 필요한 최소 표본 수입니다.
+      eta-min-samples: ${WAITING_ROOM_RESERVATION_ETA_MIN_SAMPLES:10}
+      # 짧은 관측 구간의 반환률 과대평가를 막는 최소 관측시간입니다.
+      eta-min-observation: ${WAITING_ROOM_RESERVATION_ETA_MIN_OBSERVATION:PT1M}
+      # 실측 표본이 부족할 때 사용할 초당 초기 슬롯 반환률이며 0이면 사용하지 않습니다.
+      eta-initial-release-rate-per-second: ${WAITING_ROOM_RESERVATION_ETA_INITIAL_RELEASE_RATE_PER_SECOND:0}
+      # 대기 신청 상태와 응답 정보를 Redis에 보관하는 전체 시간입니다.
+      request-ttl: ${WAITING_ROOM_RESERVATION_REQUEST_TTL:PT24H}
+      # heartbeat가 유지되더라도 대기열에 머물 수 있는 최대 시간입니다.
+      max-wait-duration: ${WAITING_ROOM_RESERVATION_MAX_WAIT_DURATION:PT23H}
+      # Browser가 입장 허용 후 이동할 대상 서비스 URL 목록입니다.
+      redirects:
+        service-entry: ${WAITING_ROOM_RESERVATION_ENTRY_URL}

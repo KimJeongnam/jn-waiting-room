@@ -1,0 +1,16 @@
+package org.jn.waitingroom.vo;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import org.jn.waitingroom.domain.WaitingRequestStatus; /**
+ * 대기 등록 응답입니다.
+ *
+ * @param reservationRequestId 대기 신청 식별자
+ * @param status 현재 상태
+ * @param waitingUrl 신규 등록 시 Browser가 이동할 Waiting Front URL
+ */
+public record CreateWaitingResponse(
+        String reservationRequestId,
+        WaitingRequestStatus status,
+        @JsonInclude(JsonInclude.Include.NON_NULL) String waitingUrl
+) {
+}
