@@ -46,7 +46,8 @@ $linuxRepositoryPath = '/' + $Matches.path.Replace('\', '/')
 $backendPath = "$linuxRepositoryPath/back-end"
 $frontendPath = "$linuxRepositoryPath/front-end"
 
-$backendCommand = ". ~/.sdkman/bin/sdkman-init.sh; export SERVER_ADDRESS='$ServerAddress' SERVER_PORT='$ServerPort'; ./gradlew :app:bootRun; exec bash"
+$frontendEntryUrl = "http://${FrontendHost}:$FrontendPort/demo/admitted"
+$backendCommand = ". ~/.sdkman/bin/sdkman-init.sh; export SERVER_ADDRESS='$ServerAddress' SERVER_PORT='$ServerPort' SPRING_PROFILES_ACTIVE='demo' SPRING_DOCKER_COMPOSE_FILE='$linuxRepositoryPath/compose.yml' WAITING_ROOM_DEMO_JWT_ENABLED='true' WAITING_ROOM_DEMO_SEED_ENABLED='true' WAITING_ROOM_OAUTH2_ENABLED='true' WAITING_ROOM_RESERVATION_ENTRY_URL='$frontendEntryUrl'; bash gradlew :app:bootRun; exec bash"
 $frontendCommand = ". ~/.nvm/nvm.sh; nvm use; export BACKEND_HOST='$BackendHost' BACKEND_PORT='$BackendPort' FRONTEND_HOST='$FrontendHost' FRONTEND_PORT='$FrontendPort'; pnpm dev; exec bash"
 
 $terminalArguments = @(

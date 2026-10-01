@@ -6,32 +6,60 @@
 spring:
   application:
     name: jn-waiting-room
+  web:
+    resources:
+      # bootJar에 포함된 production Front만 정적 리소스로 제공합니다.
+      static-locations: classpath:/wwwroot/
+  autoconfigure:
+    # Decoder 생성은 waiting-room.security.oauth2.enabled가 직접 제어합니다.
+    exclude: org.springframework.boot.security.oauth2.server.resource.autoconfigure.OAuth2ResourceServerAutoConfiguration
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${WAITING_ROOM_OAUTH2_ISSUER_URI:}
+          audiences: ${WAITING_ROOM_OAUTH2_AUDIENCE:}
   docker:
     compose:
       # back-end/app 기준으로 저장소 루트의 Compose 파일을 사용합니다.
       file: compose.yml
       # 디버깅 종료 후에도 개발용 데이터 서비스를 유지합니다.
       lifecycle-management: start-only
-  datasource:
-    # 로컬 기본값은 환경변수로 재정의할 수 있습니다.
-    url: ${DB_URL:jdbc:postgresql://localhost:5433/bulk_ticket}
-    username: ${DB_USERNAME:bulk_ticket}
-    password: ${DB_PASSWORD:bulk_ticket_dev}
   data:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
-  jpa:
-    hibernate:
-      # 테이블 생성은 Flyway가 담당합니다.
-      ddl-auto: validate
-  flyway:
-    enabled: true
+
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          # 등록된 Redis와 복구 indicator를 함께 확인하며 부분 테스트 context도 지원합니다.
+          include: "*"
+  endpoints:
+    web:
+      exposure:
+        include: health,info
 
 waiting-room:
+  security:
+    oauth2:
+      enabled: ${WAITING_ROOM_OAUTH2_ENABLED:false}
+    clients:
+      reservation-service-client:
+        services:
+          - reservation-service
   demo:
     # 운영 실행에서는 false이며 demo 프로필과 함께 명시적으로 활성화해야 합니다.
     seed-enabled: ${WAITING_ROOM_DEMO_SEED_ENABLED:false}
+    jwt-enabled: ${WAITING_ROOM_DEMO_JWT_ENABLED:false}
+    jwt-ttl: ${WAITING_ROOM_DEMO_JWT_TTL:PT12H}
+    jwt-issuer: ${WAITING_ROOM_DEMO_JWT_ISSUER:jn-waiting-room-demo}
+    jwt-audience: ${WAITING_ROOM_DEMO_JWT_AUDIENCE:waiting-room-api}
+    jwt-client-id: ${WAITING_ROOM_DEMO_JWT_CLIENT_ID:demo-reservation-client}
     # 테스트 사용자를 생성할 대상 서비스입니다.
     service-id: ${WAITING_ROOM_DEMO_SERVICE_ID:reservation-service}
     # 최초 활성 슬롯을 점유할 테스트 사용자 수입니다.
@@ -51,6 +79,14 @@ waiting-room:
   quarantine-ttl: ${WAITING_ROOM_QUARANTINE_TTL:PT1H}
   # 여러 인스턴스의 동일 서비스 유지보수 실행을 막는 lease 유지시간입니다.
   maintenance-lease-timeout: ${WAITING_ROOM_MAINTENANCE_LEASE_TIMEOUT:PT5S}
+  heartbeat-expiration-recovery-grace: ${WAITING_ROOM_HEARTBEAT_EXPIRATION_RECOVERY_GRACE:PT20M}
+  maintenance-health-timeout: ${WAITING_ROOM_MAINTENANCE_HEALTH_TIMEOUT:PT30S}
+  # prod 프로필에서 정책 확인 실패는 readiness를 닫고 메모리 포화는 새 등록만 차단합니다.
+  redis-safety-check-interval: ${WAITING_ROOM_REDIS_SAFETY_CHECK_INTERVAL:PT5S}
+  redis-memory-warning-ratio: ${WAITING_ROOM_REDIS_MEMORY_WARNING_RATIO:0.80}
+  redis-memory-block-ratio: ${WAITING_ROOM_REDIS_MEMORY_BLOCK_RATIO:0.90}
+  redis-maxmemory-policy-attested: ${WAITING_ROOM_REDIS_MAXMEMORY_POLICY_ATTESTED:false}
+  redis-maxmemory-bytes: ${WAITING_ROOM_REDIS_MAXMEMORY_BYTES:0}
   # 한 번의 유지보수 실행에서 허용할 최대 입장 수입니다.
   max-admissions-per-run: ${WAITING_ROOM_MAX_ADMISSIONS_PER_RUN:100}
   # 한 번에 정리할 최대 활성 슬롯 수입니다.
@@ -80,8 +116,11 @@ waiting-room:
       eta-initial-release-rate-per-second: ${WAITING_ROOM_RESERVATION_ETA_INITIAL_RELEASE_RATE_PER_SECOND:0}
       # 대기 신청 상태와 응답 정보를 Redis에 보관하는 전체 시간입니다.
       request-ttl: ${WAITING_ROOM_RESERVATION_REQUEST_TTL:PT24H}
+      waiting-token-ttl: ${WAITING_ROOM_RESERVATION_TOKEN_TTL:PT5M}
       # heartbeat가 유지되더라도 대기열에 머물 수 있는 최대 시간입니다.
       max-wait-duration: ${WAITING_ROOM_RESERVATION_MAX_WAIT_DURATION:PT23H}
+      # 전체 대기·입장·이용 생명주기 종료 후 요청 정리를 위한 여유시간입니다.
+      cleanup-margin: ${WAITING_ROOM_RESERVATION_CLEANUP_MARGIN:PT10M}
       # Browser가 입장 허용 후 이동할 대상 서비스 URL 목록입니다.
       redirects:
         service-entry: ${WAITING_ROOM_RESERVATION_ENTRY_URL}

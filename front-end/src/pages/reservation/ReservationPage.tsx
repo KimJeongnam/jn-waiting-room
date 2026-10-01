@@ -7,6 +7,7 @@
 import { Button, Center } from '@mantine/core'
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
+import { demoFetch } from '../../demo/demoApi'
 
 import './ReservationPage.css'
 
@@ -31,7 +32,17 @@ export function ReservationPage() {
     setError(null)
 
     try {
-      const response = await fetch('/api/v1/waiting-requests', {
+      let resetResponse: Response
+      try {
+        resetResponse = await demoFetch('/api/v1/demo/reset', { method: 'POST' })
+      } catch {
+        throw new Error('데모 테스트 데이터를 초기화하지 못했습니다.')
+      }
+      if (!resetResponse.ok) {
+        throw new Error('데모 테스트 데이터를 초기화하지 못했습니다.')
+      }
+
+      const response = await demoFetch('/api/v1/waiting-requests', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

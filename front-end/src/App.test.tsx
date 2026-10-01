@@ -32,6 +32,8 @@ describe('App routes', () => {
       'fetch',
       vi
         .fn()
+        .mockResolvedValueOnce(Response.json({ accessToken: 'demo-token', expiresAt: '2099-01-01T00:00:00Z' }))
+        .mockResolvedValueOnce({ ok: true, status: 204 })
         .mockResolvedValueOnce({
           ok: true,
           json: () =>
@@ -39,9 +41,10 @@ describe('App routes', () => {
               reservationRequestId: 'reservation-1',
               status: 'WAITING',
               waitingUrl:
-                '/waiting?serviceId=reservation-service&reservationRequestId=reservation-1',
+                '/waiting?serviceId=reservation-service#token=one-time-secret',
             }),
         })
+        .mockResolvedValueOnce({ ok: true, status: 204 })
         .mockResolvedValue({
           ok: true,
           json: () =>
@@ -57,16 +60,19 @@ describe('App routes', () => {
     )
     renderApp('/demo/reservation', true)
 
-    fireEvent.click(screen.getByRole('button', { name: '예매 신청' }))
+    fireEvent.click(await screen.findByRole('button', { name: '예매 신청' }))
 
     expect(await screen.findByText('1 명')).toBeInTheDocument()
   })
 
-  it('데모 환경에서 입장 완료 페이지를 표시한다', () => {
-    renderApp('/demo/admitted', true)
+  it('데모 환경에서 입장 API 성공 후 완료 페이지를 표시한다', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => Promise.resolve(url === '/api/v1/demo/token'
+      ? Response.json({ accessToken: 'demo-token', expiresAt: '2099-01-01T00:00:00Z' })
+      : new Response(null, { status: 200 }))))
+    renderApp('/demo/admitted?reservationRequestId=reservation-1', true)
 
     expect(
-      screen.getByRole('heading', {
+      await screen.findByRole('heading', {
         name: '예매 페이지에 입장했습니다.',
       }),
     ).toBeInTheDocument()
@@ -75,14 +81,18 @@ describe('App routes', () => {
   it.each(['/demo/reservation', '/demo/admitted'])(
     '일반 운영 환경에서 %s 경로를 노출하지 않는다',
     (path) => {
+      const fetchMock = vi.fn()
+      vi.stubGlobal('fetch', fetchMock)
       renderApp(path, false)
 
       expect(screen.getByText('페이지를 찾을 수 없습니다.')).toBeInTheDocument()
+      expect(fetchMock).not.toHaveBeenCalled()
     },
   )
 
   it('일반 운영 환경에서도 대기 페이지를 표시한다', () => {
-    renderApp('/waiting', false)
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() => new Promise(() => {})))
+    renderApp('/waiting?serviceId=reservation-service#token=one-time-secret', false)
 
     expect(
       screen.getByRole('heading', {

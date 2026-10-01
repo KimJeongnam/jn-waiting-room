@@ -8,6 +8,8 @@ package org.jn.waitingroom.redis;
 
 import org.jn.waitingroom.domain.WaitingRequestState;
 import org.jn.waitingroom.domain.WaitingRequestStatus;
+import org.jn.waitingroom.domain.WaitingSecret;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Repository;
@@ -25,6 +27,47 @@ import java.util.Set;
 @Repository
 public class RedisWaitingRoomStore {
     private static final String SERVICE_ID_PATTERN = "[a-z0-9-]+";
+    private static final int MAX_TOKEN_ISSUE_ATTEMPTS = 8;
+
+    // Redis TTL은 정리 여유시간을 포함하므로 실제 유예 여부는 JSON expiresAt으로 판단합니다.
+    private static final String RECOVERY_BARRIER_FUNCTION = """
+            local function recovery_barrier_active(key, now)
+                local encoded = redis.call('GET', key)
+                if not encoded then return false end
+                local barrier = cjson.decode(encoded)
+                return now < tonumber(barrier.expiresAt)
+            end
+            """;
+
+    private static final DefaultRedisScript<List> BOOTSTRAP_RECOVERY_SCRIPT = script("""
+            local time = redis.call('TIME')
+            local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+            if redis.call('ZCARD', KEYS[1]) == 0 then
+                redis.call('DEL', KEYS[3])
+                return {'0', '0'}
+            end
+            local existing = redis.call('GET', KEYS[3])
+            if existing then
+                local barrier = cjson.decode(existing)
+                if now < tonumber(barrier.expiresAt) then return {'1', tostring(barrier.expiresAt)} end
+            end
+            -- 정리 TTL이 남은 기록도 서비스 heartbeatTimeout보다 오래됐으면 복구가 필요합니다.
+            local lastMaintenanceAt = tonumber(redis.call('GET', KEYS[2]))
+            if lastMaintenanceAt and now - lastMaintenanceAt < tonumber(ARGV[4]) then return {'0', '0'} end
+            local expiresAt = now + tonumber(ARGV[2])
+            local barrier = cjson.encode({recoveryId = ARGV[1], recoveredAt = now, expiresAt = expiresAt})
+            redis.call('SET', KEYS[3], barrier, 'PX', ARGV[3])
+            return {'1', tostring(expiresAt)}
+            """);
+
+    private static final DefaultRedisScript<Long> MAINTENANCE_HEARTBEAT_SCRIPT = new DefaultRedisScript<>("""
+            -- 만료되거나 교체된 pass는 정상 유지보수 기록을 갱신할 수 없습니다.
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+            local time = redis.call('TIME')
+            local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+            redis.call('SET', KEYS[2], tostring(now), 'PX', ARGV[2])
+            return 1
+            """, Long.class);
 
     private static final DefaultRedisScript<List> REGISTER_SCRIPT = script("""
             local function valid_type(key, expected)
@@ -56,13 +99,161 @@ public class RedisWaitingRoomStore {
             state.createdAt = now
             local encoded = cjson.encode(state)
 
+            if not valid_type(KEYS[4], 'string') then
+                return {'STORE_ERROR', ''}
+            end
+            local access = cjson.encode({serviceId = ARGV[3], reservationRequestId = ARGV[5], version = 1})
+            -- score는 ms 기준이며 동점마다 0.001ms를 더합니다. 극단적 동시 등록에서는 누적될 수 있습니다.
+            local waitingScore = now
+            local last = redis.call('ZREVRANGE', KEYS[2], 0, 0, 'WITHSCORES')
+            if #last > 0 then waitingScore = math.max(now, tonumber(last[2]) + 0.001) end
             redis.call('SET', KEYS[1], encoded, 'PX', ARGV[2])
-            redis.call('ZADD', KEYS[2], 'NX', now, ARGV[5])
+            redis.call('ZADD', KEYS[2], 'NX', waitingScore, ARGV[5])
             redis.call('ZADD', KEYS[3], 'NX', now, ARGV[5])
+            redis.call('SET', KEYS[4], access, 'PX', ARGV[6])
             return {'CREATED', encoded}
             """);
 
-    private static final DefaultRedisScript<List> ADMIT_SCRIPT = script("""
+    // 모든 key는 Java에서 전달하며 사전 조회 뒤의 재발급 경쟁을 Lua 안에서 다시 검증합니다.
+    private static final DefaultRedisScript<List> CONSUME_TOKEN_SCRIPT = script(RECOVERY_BARRIER_FUNCTION + """
+            for index, key in ipairs(KEYS) do
+                local kind = redis.call('TYPE', key)['ok']
+                local expected = (index <= 4 or index == 8) and 'string' or 'zset'
+                if kind ~= 'none' and kind ~= expected then return {'INVALID_SESSION', ''} end
+            end
+            local tokenEncoded = redis.call('GET', KEYS[1])
+            local encoded = redis.call('GET', KEYS[2])
+            if not tokenEncoded or not encoded then return {'INVALID_SESSION', ''} end
+            local validToken, token = pcall(cjson.decode, tokenEncoded)
+            local validState, state = pcall(cjson.decode, encoded)
+            if not validToken or type(token) ~= 'table' or not validState or type(state) ~= 'table'
+                    or token.serviceId ~= ARGV[1] or token.reservationRequestId ~= ARGV[2]
+                    or state.serviceId ~= ARGV[1] or state.reservationRequestId ~= ARGV[2]
+                    or token.version ~= state.waitingSessionVersion
+                    or state.currentWaitingTokenHash ~= ARGV[3]
+                    or (state.currentWaitingSessionHash or '') ~= ARGV[5] then
+                return {'INVALID_SESSION', ''}
+            end
+            local ttl = redis.call('PTTL', KEYS[2])
+            if ttl <= 0 then return {'INVALID_SESSION', ''} end
+            if state.status ~= 'WAITING' and state.status ~= 'ADMITTED' then
+                return {'INVALID_SESSION', ''}
+            end
+            -- token 검증과 시간 만료 처리를 묶어 Scheduler 실행 전의 세션 발급도 차단합니다.
+            local time = redis.call('TIME')
+            local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+            local reason = nil
+            if state.status == 'WAITING' then
+                local waiting = tonumber(redis.call('ZSCORE', KEYS[5], ARGV[2]))
+                local heartbeat = tonumber(redis.call('ZSCORE', KEYS[6], ARGV[2]))
+                if not waiting or not heartbeat then reason = 'INTERNAL_INCONSISTENCY'
+                elseif now - waiting >= tonumber(ARGV[7]) then reason = 'MAX_WAIT_DURATION'
+                elseif not recovery_barrier_active(KEYS[8], now)
+                        and now - heartbeat >= tonumber(ARGV[6]) then reason = 'HEARTBEAT_TIMEOUT' end
+            else
+                local expiry = tonumber(redis.call('ZSCORE', KEYS[7], ARGV[2]))
+                if not expiry or expiry <= now then reason = 'ADMISSION_TIMEOUT' end
+            end
+            if reason then
+                state.status = 'EXPIRED'
+                state.expiredAt = now
+                state.expirationReason = reason
+                state.currentWaitingTokenHash = nil
+                state.currentWaitingSessionHash = nil
+                redis.call('SET', KEYS[2], cjson.encode(state), 'KEEPTTL')
+                redis.call('DEL', KEYS[1], KEYS[3])
+                redis.call('ZREM', KEYS[5], ARGV[2])
+                redis.call('ZREM', KEYS[6], ARGV[2])
+                if redis.call('ZREM', KEYS[7], ARGV[2]) == 1 then
+                    redis.call('ZADD', KEYS[9], now, ARGV[2])
+                    redis.call('ZREMRANGEBYSCORE', KEYS[9], '-inf', '(' .. (now - tonumber(ARGV[9])))
+                    redis.call('PEXPIRE', KEYS[9], tonumber(ARGV[9]) * 2)
+                    redis.call('PUBLISH', ARGV[8], ARGV[2])
+                end
+                return {'INVALID_SESSION', ''}
+            end
+            local session = cjson.encode({serviceId = ARGV[1], reservationRequestId = ARGV[2],
+                    version = state.waitingSessionVersion, nextPollAllowedAt = 0})
+            state.currentWaitingTokenHash = nil
+            state.currentWaitingSessionHash = ARGV[4]
+            encoded = cjson.encode(state)
+            redis.call('DEL', KEYS[1], KEYS[3])
+            redis.call('SET', KEYS[4], session, 'PX', ttl)
+            redis.call('SET', KEYS[2], encoded, 'KEEPTTL')
+            return {'APPLIED', encoded}
+            """);
+
+    private static final DefaultRedisScript<List> ISSUE_TOKEN_SCRIPT = script(RECOVERY_BARRIER_FUNCTION + """
+            for index, key in ipairs(KEYS) do
+                local kind = redis.call('TYPE', key)['ok']
+                local expected = (index <= 4 or index == 9) and 'string' or 'zset'
+                if kind ~= 'none' and kind ~= expected then return {'STORE_ERROR', ''} end
+            end
+            local encoded = redis.call('GET', KEYS[1])
+            if not encoded then return {'NOT_FOUND', ''} end
+            local decoded, state = pcall(cjson.decode, encoded)
+            if not decoded or type(state) ~= 'table'
+                    or state.serviceId ~= ARGV[1] or state.reservationRequestId ~= ARGV[2] then
+                return {'STORE_ERROR', ''}
+            end
+            -- JSON null은 Lua에서 truthy이므로 Java의 누락값과 같은 값으로 정규화합니다.
+            if state.currentWaitingTokenHash == cjson.null then state.currentWaitingTokenHash = nil end
+            if state.currentWaitingSessionHash == cjson.null then state.currentWaitingSessionHash = nil end
+            if state.waitingSessionVersion == cjson.null then state.waitingSessionVersion = nil end
+            if (state.currentWaitingTokenHash or '') ~= ARGV[3]
+                    or (state.currentWaitingSessionHash or '') ~= ARGV[4]
+                    or (state.waitingSessionVersion or 0) ~= tonumber(ARGV[5]) then
+                return {'RETRY', ''}
+            end
+            if state.status ~= 'WAITING' and state.status ~= 'ADMITTED' then
+                return {'CONFLICT', encoded}
+            end
+            local time = redis.call('TIME')
+            local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+            local reason = nil
+            if state.status == 'WAITING' then
+                local waiting = tonumber(redis.call('ZSCORE', KEYS[5], ARGV[2]))
+                local heartbeat = tonumber(redis.call('ZSCORE', KEYS[6], ARGV[2]))
+                if not waiting or not heartbeat then return {'STORE_ERROR', ''} end
+                if now - waiting >= tonumber(ARGV[9]) then reason = 'MAX_WAIT_DURATION'
+                elseif not recovery_barrier_active(KEYS[9], now)
+                        and now - heartbeat >= tonumber(ARGV[8]) then reason = 'HEARTBEAT_TIMEOUT' end
+            else
+                local expiry = tonumber(redis.call('ZSCORE', KEYS[7], ARGV[2]))
+                if not expiry or expiry <= now then reason = 'ADMISSION_TIMEOUT' end
+            end
+            if reason then
+                state.status = 'EXPIRED'
+                state.expiredAt = now
+                state.expirationReason = reason
+                state.currentWaitingTokenHash = nil
+                state.currentWaitingSessionHash = nil
+                encoded = cjson.encode(state)
+                redis.call('SET', KEYS[1], encoded, 'KEEPTTL')
+                redis.call('DEL', KEYS[2], KEYS[3])
+                redis.call('ZREM', KEYS[5], ARGV[2])
+                redis.call('ZREM', KEYS[6], ARGV[2])
+                if redis.call('ZREM', KEYS[7], ARGV[2]) == 1 then
+                    redis.call('ZADD', KEYS[8], now, ARGV[2])
+                    redis.call('ZREMRANGEBYSCORE', KEYS[8], '-inf', '(' .. (now - tonumber(ARGV[11])))
+                    redis.call('PEXPIRE', KEYS[8], tonumber(ARGV[11]) * 2)
+                    redis.call('PUBLISH', ARGV[10], ARGV[2])
+                end
+                return {reason == 'ADMISSION_TIMEOUT' and 'ADMISSION_EXPIRED' or 'CONFLICT', encoded}
+            end
+            state.waitingSessionVersion = (state.waitingSessionVersion or 0) + 1
+            state.currentWaitingTokenHash = ARGV[6]
+            state.currentWaitingSessionHash = nil
+            local token = cjson.encode({serviceId = ARGV[1], reservationRequestId = ARGV[2],
+                    version = state.waitingSessionVersion})
+            encoded = cjson.encode(state)
+            redis.call('DEL', KEYS[2], KEYS[3])
+            redis.call('SET', KEYS[4], token, 'PX', ARGV[7])
+            redis.call('SET', KEYS[1], encoded, 'KEEPTTL')
+            return {'APPLIED', encoded}
+            """);
+
+    private static final DefaultRedisScript<List> ADMIT_SCRIPT = script(RECOVERY_BARRIER_FUNCTION + """
             local function valid_type(key, expected)
                 local current = redis.call('TYPE', key)['ok']
                 return current == 'none' or current == expected
@@ -160,6 +351,11 @@ public class RedisWaitingRoomStore {
             local heartbeatScore = redis.call('ZSCORE', KEYS[3], ARGV[1])
             if not waitingScore or not heartbeatScore then
                 return expire_inconsistent()
+            end
+            -- 복구 중 heartbeat가 오래된 선두를 건너뛰지 않아 FIFO를 보존합니다.
+            if recovery_barrier_active(KEYS[6], now)
+                    and now - tonumber(heartbeatScore) >= tonumber(ARGV[4]) then
+                return {'RETRY', ''}
             end
             if now - tonumber(heartbeatScore) >= tonumber(ARGV[4])
                     or now - tonumber(waitingScore) >= tonumber(ARGV[5]) then
@@ -356,7 +552,7 @@ public class RedisWaitingRoomStore {
             return {'APPLIED', encoded}
             """);
 
-    private static final DefaultRedisScript<List> POLL_SCRIPT = script("""
+    private static final DefaultRedisScript<List> POLL_SCRIPT = script(RECOVERY_BARRIER_FUNCTION + """
             local function valid_type(key, expected)
                 local current = redis.call('TYPE', key)['ok']
                 return current == 'none' or current == expected
@@ -378,6 +574,19 @@ public class RedisWaitingRoomStore {
             if not decoded or state.serviceId ~= ARGV[2] then
                 return {'STORE_ERROR', '', '', '', '', ''}
             end
+            if not valid_type(KEYS[6], 'string') then
+                return {'INVALID_SESSION', '', '', '', '', ''}
+            end
+            local sessionEncoded = redis.call('GET', KEYS[6])
+            if not sessionEncoded then return {'INVALID_SESSION', '', '', '', '', ''} end
+            local validSession, session = pcall(cjson.decode, sessionEncoded)
+            if not validSession or type(session) ~= 'table'
+                    or session.serviceId ~= ARGV[2] or session.reservationRequestId ~= ARGV[1]
+                    or state.reservationRequestId ~= ARGV[1]
+                    or session.version ~= state.waitingSessionVersion
+                    or state.currentWaitingSessionHash ~= ARGV[16] then
+                return {'INVALID_SESSION', '', '', '', '', ''}
+            end
             if state.status ~= 'WAITING' then
                 return {'FOUND', encoded, '', '0', '', ''}
             end
@@ -391,7 +600,8 @@ public class RedisWaitingRoomStore {
             local currentTime = redis.call('TIME')
             local now = tonumber(currentTime[1]) * 1000 + math.floor(tonumber(currentTime[2]) / 1000)
             local remainingHeartbeat = tonumber(heartbeatScore) + tonumber(ARGV[7]) - now
-            if remainingHeartbeat <= 0 then
+            local barrierActive = recovery_barrier_active(KEYS[7], now)
+            if remainingHeartbeat <= 0 and not barrierActive then
                 state.status = 'EXPIRED'
                 state.expiredAt = now
                 state.expirationReason = 'HEARTBEAT_TIMEOUT'
@@ -402,10 +612,10 @@ public class RedisWaitingRoomStore {
                 return {'FOUND', encoded, '', tostring(redis.call('ZCARD', KEYS[2])), '', ''}
             end
 
-            local nextPollAllowedAt = tonumber(state.nextPollAllowedAt)
+            local nextPollAllowedAt = tonumber(session.nextPollAllowedAt)
             if nextPollAllowedAt and nextPollAllowedAt > now then
                 local safetyMargin = tonumber(ARGV[9])
-                if remainingHeartbeat <= safetyMargin then
+                if remainingHeartbeat <= safetyMargin and not barrierActive then
                     state.status = 'EXPIRED'
                     state.expiredAt = now
                     state.expirationReason = 'HEARTBEAT_TIMEOUT'
@@ -419,7 +629,7 @@ public class RedisWaitingRoomStore {
                 local retryAfter = math.min(
                     nextPollAllowedAt - now,
                     tonumber(ARGV[8]),
-                    remainingHeartbeat - safetyMargin
+                    barrierActive and tonumber(ARGV[8]) or remainingHeartbeat - safetyMargin
                 )
                 return {'RATE_LIMITED', encoded, '', '', tostring(math.max(1, retryAfter)), ''}
             end
@@ -459,9 +669,8 @@ public class RedisWaitingRoomStore {
                 selectedPollDelay = tonumber(ARGV[4])
             end
 
-            state.nextPollAllowedAt = now + selectedPollDelay
-            encoded = cjson.encode(state)
-            redis.call('SET', KEYS[1], encoded, 'KEEPTTL')
+            session.nextPollAllowedAt = now + selectedPollDelay
+            redis.call('SET', KEYS[6], cjson.encode(session), 'KEEPTTL')
             redis.call('ZADD', KEYS[3], 'XX', now, ARGV[1])
             local waitingCount = redis.call('ZCARD', KEYS[2])
             local encodedEta = estimatedWaitSeconds and tostring(estimatedWaitSeconds) or ''
@@ -571,7 +780,7 @@ public class RedisWaitingRoomStore {
             return {'APPLIED', encoded}
             """);
 
-    private static final DefaultRedisScript<List> EXPIRE_WAITING_SCRIPT = script("""
+    private static final DefaultRedisScript<List> EXPIRE_WAITING_SCRIPT = script(RECOVERY_BARRIER_FUNCTION + """
             local function valid_type(key, expected)
                 local current = redis.call('TYPE', key)['ok']
                 return current == 'none' or current == expected
@@ -593,7 +802,8 @@ public class RedisWaitingRoomStore {
             local reason = nil
             if waitingScore and now - tonumber(waitingScore) >= tonumber(ARGV[2]) then
                 reason = 'MAX_WAIT_DURATION'
-            elseif heartbeatScore and now - tonumber(heartbeatScore) >= tonumber(ARGV[3]) then
+            elseif heartbeatScore and now - tonumber(heartbeatScore) >= tonumber(ARGV[3])
+                    and not recovery_barrier_active(KEYS[5], now) then
                 reason = 'HEARTBEAT_TIMEOUT'
             end
             if not reason then
@@ -689,6 +899,15 @@ public class RedisWaitingRoomStore {
             String redirectTargetId,
             Duration requestTtl
     ) {
+        return register(serviceId, reservationRequestId, payloadFingerprint, redirectTargetId, requestTtl,
+                WaitingSecret.hash(WaitingSecret.generate()), Duration.ofMinutes(5));
+    }
+
+    /** 신규 요청과 해시된 일회용 토큰을 하나의 Lua 실행으로 등록합니다. */
+    public WriteResult register(
+            String serviceId, String reservationRequestId, String payloadFingerprint, String redirectTargetId,
+            Duration requestTtl, String tokenHash, Duration waitingTokenTtl
+    ) {
         validateIdentifiers(serviceId, reservationRequestId);
         var state = new WaitingRequestState(
                 reservationRequestId,
@@ -702,18 +921,84 @@ public class RedisWaitingRoomStore {
                 null,
                 null,
                 null,
-                null
+                null,
+                tokenHash,
+                null,
+                1L
         );
 
         return execute(
                 REGISTER_SCRIPT,
-                List.of(requestKey(serviceId, reservationRequestId), waitingKey(serviceId), heartbeatKey(serviceId)),
+                List.of(requestKey(serviceId, reservationRequestId), waitingKey(serviceId), heartbeatKey(serviceId),
+                        accessKey(serviceId, tokenHash)),
                 writeJson(state),
                 Long.toString(requestTtl.toMillis()),
                 serviceId,
                 payloadFingerprint,
-                reservationRequestId
+                reservationRequestId,
+                Long.toString(waitingTokenTtl.toMillis())
         );
+    }
+
+    /** 토큰을 한 번 소비하고 요청 TTL 안에서 새 Browser 세션을 생성합니다. */
+    public WriteResult consumeToken(String serviceId, String tokenHash, String sessionHash,
+                                   Duration heartbeatTimeout, Duration maxWaitDuration, Duration etaWindow) {
+        validateServiceId(serviceId);
+        var token = readCredential(accessKey(serviceId, tokenHash));
+        if (token == null || !serviceId.equals(token.serviceId()) || token.reservationRequestId() == null) {
+            return new WriteResult(ResultType.INVALID_SESSION, null);
+        }
+        var state = find(serviceId, token.reservationRequestId());
+        String previousSession = state == null ? "" : Objects.toString(state.currentWaitingSessionHash(), "");
+        return execute(CONSUME_TOKEN_SCRIPT,
+                List.of(accessKey(serviceId, tokenHash), requestKey(serviceId, token.reservationRequestId()),
+                        sessionKey(serviceId, previousSession), sessionKey(serviceId, sessionHash),
+                        waitingKey(serviceId), heartbeatKey(serviceId), activeSlotsKey(serviceId),
+                        heartbeatExpiryBarrierKey(serviceId), slotReleaseEventsKey(serviceId)),
+                serviceId, token.reservationRequestId(), tokenHash, sessionHash, previousSession,
+                Long.toString(heartbeatTimeout.toMillis()), Long.toString(maxWaitDuration.toMillis()),
+                slotReleasedChannel(serviceId), Long.toString(etaWindow.toMillis()));
+    }
+
+    /** 세션 조회는 경로 결정용이며 최종 인증은 Polling Lua에서 다시 수행합니다. */
+    public Credential findSession(String serviceId, String sessionHash) {
+        validateServiceId(serviceId);
+        return readCredential(sessionKey(serviceId, sessionHash));
+    }
+
+    /** 이전 토큰/세션을 폐기하고 발급하며, 반복 경쟁은 8회 시도 후 저장소 오류로 종료합니다. */
+    public WriteResult issueToken(
+            String serviceId, String reservationRequestId, String tokenHash, Duration tokenTtl,
+            Duration heartbeatTimeout, Duration maxWaitDuration, Duration etaWindow
+    ) {
+        validateIdentifiers(serviceId, reservationRequestId);
+        for (int attempt = 0; attempt < MAX_TOKEN_ISSUE_ATTEMPTS; attempt++) {
+            var state = find(serviceId, reservationRequestId);
+            if (state == null) return new WriteResult(ResultType.NOT_FOUND, null);
+            String oldToken = Objects.toString(state.currentWaitingTokenHash(), "");
+            String oldSession = Objects.toString(state.currentWaitingSessionHash(), "");
+            var result = execute(ISSUE_TOKEN_SCRIPT,
+                    List.of(requestKey(serviceId, reservationRequestId), accessKey(serviceId, oldToken),
+                            sessionKey(serviceId, oldSession), accessKey(serviceId, tokenHash),
+                            waitingKey(serviceId), heartbeatKey(serviceId), activeSlotsKey(serviceId),
+                            slotReleaseEventsKey(serviceId), heartbeatExpiryBarrierKey(serviceId)),
+                    serviceId, reservationRequestId, oldToken, oldSession,
+                    Objects.toString(state.waitingSessionVersion(), "0"), tokenHash, Long.toString(tokenTtl.toMillis()),
+                    Long.toString(heartbeatTimeout.toMillis()), Long.toString(maxWaitDuration.toMillis()),
+                    slotReleasedChannel(serviceId), Long.toString(etaWindow.toMillis()));
+            if (result.type() != ResultType.RETRY) return result;
+        }
+        return new WriteResult(ResultType.STORE_ERROR, null);
+    }
+
+    private Credential readCredential(String key) {
+        String encoded = redis.opsForValue().get(key);
+        if (encoded == null) return null;
+        try {
+            return objectMapper.readValue(encoded, Credential.class);
+        } catch (tools.jackson.core.JacksonException exception) {
+            return null;
+        }
     }
 
     /**
@@ -751,7 +1036,8 @@ public class RedisWaitingRoomStore {
                         waitingKey(serviceId),
                         heartbeatKey(serviceId),
                         activeSlotsKey(serviceId),
-                        quarantineKey(serviceId, reservationRequestId, System.currentTimeMillis())
+                        quarantineKey(serviceId, reservationRequestId, System.currentTimeMillis()),
+                        heartbeatExpiryBarrierKey(serviceId)
                 ),
                 reservationRequestId,
                 Integer.toString(maxConcurrentUsers),
@@ -763,32 +1049,59 @@ public class RedisWaitingRoomStore {
         );
     }
 
+    /** 활성 barrier는 연장하지 않고 재사용하며, 오래된 유지보수 기록이면 새 barrier를 만듭니다. */
+    public RecoveryBootstrap bootstrapRecovery(
+            String serviceId, String recoveryId, Duration recoveryGrace, Duration cleanupMargin, Duration heartbeatTimeout
+    ) {
+        validateServiceId(serviceId);
+        if (recoveryId == null || recoveryId.isBlank()) {
+            throw new IllegalArgumentException("recoveryId는 비어 있을 수 없습니다.");
+        }
+        List<?> response = redis.execute(BOOTSTRAP_RECOVERY_SCRIPT,
+                List.of(waitingKey(serviceId), maintenanceHeartbeatKey(serviceId), heartbeatExpiryBarrierKey(serviceId)),
+                recoveryId, Long.toString(recoveryGrace.toMillis()), Long.toString(recoveryGrace.plus(cleanupMargin).toMillis()),
+                Long.toString(heartbeatTimeout.toMillis()));
+        if (response == null || response.size() != 2) {
+            throw new IllegalStateException("Redis recovery bootstrap이 올바른 결과를 반환하지 않았습니다.");
+        }
+        return new RecoveryBootstrap("1".equals(response.get(0).toString()), Long.parseLong(response.get(1).toString()));
+    }
+
+    /** 현재 pass의 lease 소유권을 원자 확인한 경우에만 정상 시각과 TTL을 기록합니다. */
+    public boolean recordMaintenanceHeartbeat(String serviceId, String leaseToken, Duration healthTimeout) {
+        validateServiceId(serviceId);
+        Long result = redis.execute(MAINTENANCE_HEARTBEAT_SCRIPT,
+                List.of(maintenanceLeaseKey(serviceId), maintenanceHeartbeatKey(serviceId)),
+                leaseToken, Long.toString(healthTimeout.toMillis()));
+        return Long.valueOf(1L).equals(result);
+    }
+
     /**
      * 서비스 단위 유지보수 lease를 획득합니다.
      *
      * @param serviceId 대상 서비스 식별자
-     * @param instanceId lease 소유 Waiting Room 인스턴스 식별자
+     * @param leaseToken 현재 유지보수 pass의 고유 lease 소유권 토큰
      * @param leaseTimeout 장애 시 lease가 자동 해제되는 최대 시간
      * @return 현재 인스턴스가 lease를 획득했으면 {@code true}
      */
-    public boolean tryAcquireMaintenanceLease(String serviceId, String instanceId, Duration leaseTimeout) {
+    public boolean tryAcquireMaintenanceLease(String serviceId, String leaseToken, Duration leaseTimeout) {
         validateServiceId(serviceId);
         return Boolean.TRUE.equals(redis.opsForValue().setIfAbsent(
                 maintenanceLeaseKey(serviceId),
-                instanceId,
+                leaseToken,
                 leaseTimeout
         ));
     }
 
     /**
-     * 현재 인스턴스가 소유한 서비스 유지보수 lease만 해제합니다.
+     * 현재 pass가 여전히 소유한 서비스 유지보수 lease만 해제합니다.
      *
      * @param serviceId 대상 서비스 식별자
-     * @param instanceId lease 소유 Waiting Room 인스턴스 식별자
+     * @param leaseToken 현재 유지보수 pass의 고유 lease 소유권 토큰
      */
-    public void releaseMaintenanceLease(String serviceId, String instanceId) {
+    public void releaseMaintenanceLease(String serviceId, String leaseToken) {
         validateServiceId(serviceId);
-        redis.execute(RELEASE_LEASE_SCRIPT, List.of(maintenanceLeaseKey(serviceId)), instanceId);
+        redis.execute(RELEASE_LEASE_SCRIPT, List.of(maintenanceLeaseKey(serviceId)), leaseToken);
     }
 
     /**
@@ -883,7 +1196,8 @@ public class RedisWaitingRoomStore {
                         requestKey(serviceId, reservationRequestId),
                         waitingKey(serviceId),
                         heartbeatKey(serviceId),
-                        quarantineKey(serviceId, reservationRequestId, System.currentTimeMillis())
+                        quarantineKey(serviceId, reservationRequestId, System.currentTimeMillis()),
+                        heartbeatExpiryBarrierKey(serviceId)
                 ),
                 reservationRequestId,
                 Long.toString(maxWaitDuration.toMillis()),
@@ -1002,6 +1316,7 @@ public class RedisWaitingRoomStore {
      * @param etaInitialReleaseRatePerSecond 실측 표본 부족 시 사용할 초당 초기 슬롯 반환률이며 0이면 비활성화
      * @param maxAdmissionsPerRun 한 스케줄러 실행에서 허용할 최대 입장 수
      * @param schedulerInterval 입장 스케줄러 실행 주기
+     * @param sessionHash 인증할 Browser 세션의 SHA-256 해시
      * @return 현재 요청 상태와 대기열 snapshot
      */
     public WaitingSnapshot poll(
@@ -1019,9 +1334,13 @@ public class RedisWaitingRoomStore {
             Duration etaMinObservation,
             double etaInitialReleaseRatePerSecond,
             int maxAdmissionsPerRun,
-            Duration schedulerInterval
+            Duration schedulerInterval,
+            String sessionHash
     ) {
         validateIdentifiers(serviceId, reservationRequestId);
+        if (sessionHash == null || !sessionHash.matches("[a-f0-9]{64}")) {
+            return new WaitingSnapshot(ResultType.INVALID_SESSION, null, null, 0, null, null);
+        }
         List<?> response = redis.execute(
                 POLL_SCRIPT,
                 List.of(
@@ -1029,7 +1348,9 @@ public class RedisWaitingRoomStore {
                         waitingKey(serviceId),
                         heartbeatKey(serviceId),
                         activeSlotsKey(serviceId),
-                        slotReleaseEventsKey(serviceId)
+                        slotReleaseEventsKey(serviceId),
+                        sessionKey(serviceId, sessionHash),
+                        heartbeatExpiryBarrierKey(serviceId)
                 ),
                 reservationRequestId,
                 serviceId,
@@ -1045,7 +1366,8 @@ public class RedisWaitingRoomStore {
                 Long.toString(etaMinObservation.toMillis()),
                 Double.toString(etaInitialReleaseRatePerSecond),
                 Integer.toString(maxAdmissionsPerRun),
-                Long.toString(schedulerInterval.toMillis())
+                Long.toString(schedulerInterval.toMillis()),
+                sessionHash
         );
         if (response == null || response.size() < 6) {
             throw new IllegalStateException("Redis Polling Lua script가 올바른 결과를 반환하지 않았습니다.");
@@ -1145,8 +1467,24 @@ public class RedisWaitingRoomStore {
         return "waiting-request:{" + serviceId + "}:" + reservationRequestId;
     }
 
+    private static String accessKey(String serviceId, String tokenHash) {
+        return "waiting-access:{" + serviceId + "}:" + tokenHash;
+    }
+
+    private static String sessionKey(String serviceId, String sessionHash) {
+        return "waiting-session:{" + serviceId + "}:" + sessionHash;
+    }
+
     private static String maintenanceLeaseKey(String serviceId) {
         return "maintenance-lease:{" + serviceId + "}";
+    }
+
+    private static String maintenanceHeartbeatKey(String serviceId) {
+        return "maintenance-heartbeat:{" + serviceId + "}";
+    }
+
+    private static String heartbeatExpiryBarrierKey(String serviceId) {
+        return "heartbeat-expiry-barrier:{" + serviceId + "}";
     }
 
     private static String quarantineKey(String serviceId, String reservationRequestId, long detectedAt) {
@@ -1159,6 +1497,8 @@ public class RedisWaitingRoomStore {
 
     /** Redis 원자 처리의 업무 결과입니다. */
     public enum ResultType {
+        /** Browser의 토큰 또는 세션이 최신 요청 자격과 일치하지 않습니다. */
+        INVALID_SESSION,
         /** 대기 요청이 새로 등록됐습니다. */
         CREATED,
 
@@ -1199,6 +1539,10 @@ public class RedisWaitingRoomStore {
         NOT_FOUND
     }
 
+    /** 복구 유예의 활성 여부와 Redis가 결정한 원래 만료시각입니다. */
+    public record RecoveryBootstrap(boolean barrierActive, long barrierExpiresAtEpochMs) {
+    }
+
     /**
      * Lua 처리 결과와 변경 후 요청 상태입니다.
      *
@@ -1206,6 +1550,17 @@ public class RedisWaitingRoomStore {
      * @param state 처리 후 상태이며 상태가 없는 결과에서는 {@code null}
      */
     public record WriteResult(ResultType type, WaitingRequestState state) {
+    }
+
+    /**
+     * 비밀 원문 없이 저장되는 토큰/세션의 요청 연결 정보입니다.
+     * @param serviceId 대상 서비스
+     * @param reservationRequestId 연결된 요청
+     * @param version 요청 자격 버전
+     * @param nextPollAllowedAt 세션의 다음 조회 허용 시각 (토큰에는 없음)
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record Credential(String serviceId, String reservationRequestId, long version, Long nextPollAllowedAt) {
     }
 
     /**

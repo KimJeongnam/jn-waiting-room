@@ -5,6 +5,8 @@
       <env name="SERVER_ADDRESS" value="127.0.0.1" />
       <env name="SERVER_PORT" value="8080" />
       <env name="SPRING_PROFILES_ACTIVE" value="demo" />
+      <env name="WAITING_ROOM_DEMO_JWT_ENABLED" value="true" />
+      <env name="WAITING_ROOM_OAUTH2_ENABLED" value="true" />
       <env name="WAITING_ROOM_DEMO_ACTIVE_EXPIRY_MAX" value="PT2M30S" />
       <env name="WAITING_ROOM_DEMO_ACTIVE_EXPIRY_MIN" value="PT30S" />
       <env name="WAITING_ROOM_DEMO_ACTIVE_USERS" value="5000" />

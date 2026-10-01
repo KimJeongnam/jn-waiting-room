@@ -13,4 +13,10 @@ public record CreateWaitingResponse(
         WaitingRequestStatus status,
         @JsonInclude(JsonInclude.Include.NON_NULL) String waitingUrl
 ) {
+    /** MVC 진단 로그에서도 fragment의 토큰 원문을 출력하지 않습니다. */
+    @Override
+    public String toString() {
+        return "CreateWaitingResponse[reservationRequestId=" + reservationRequestId
+                + ", status=" + status + ", waitingUrl=redacted]";
+    }
 }

@@ -1,0 +1,26 @@
+# @author jeongnam
+# @since 2026-09-30
+# @file application-demo.yml
+# @description demo 프로필의 실행 기본값과 데모 JWT client의 대상 서비스를 정의합니다.
+
+waiting-room:
+  # 예매하기 reset의 기본 인원과 만료 범위를 기존 환경변수로 덮어쓸 수 있습니다.
+  demo:
+    active-users: ${WAITING_ROOM_DEMO_ACTIVE_USERS:5000}
+    waiting-users: ${WAITING_ROOM_DEMO_WAITING_USERS:10000}
+    active-expiry-min: ${WAITING_ROOM_DEMO_ACTIVE_EXPIRY_MIN:PT30S}
+    active-expiry-max: ${WAITING_ROOM_DEMO_ACTIVE_EXPIRY_MAX:PT2M30S}
+  max-admissions-per-run: ${WAITING_ROOM_MAX_ADMISSIONS_PER_RUN:60}
+  services:
+    reservation-service:
+      max-concurrent-users: ${WAITING_ROOM_RESERVATION_MAX_CONCURRENT_USERS:5000}
+      admission-timeout: ${WAITING_ROOM_RESERVATION_ADMISSION_TIMEOUT:PT1M}
+      eta-initial-release-rate-per-second: ${WAITING_ROOM_RESERVATION_ETA_INITIAL_RELEASE_RATE_PER_SECOND:55.6}
+      eta-min-samples: ${WAITING_ROOM_RESERVATION_ETA_MIN_SAMPLES:5000}
+      redirects:
+        service-entry: ${WAITING_ROOM_RESERVATION_ENTRY_URL:http://localhost:5173/demo/admitted}
+  security:
+    clients:
+      demo-reservation-client:
+        services:
+          - reservation-service

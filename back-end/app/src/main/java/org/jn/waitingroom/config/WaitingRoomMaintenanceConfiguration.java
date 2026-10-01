@@ -41,6 +41,8 @@ public class WaitingRoomMaintenanceConfiguration {
             WaitingRoomMaintenanceService maintenanceService
     ) {
         var container = new RedisMessageListenerContainer();
+        // Redis가 끊겨도 HTTP/health 서버는 기동하고 복구 coordinator가 구독을 시작합니다.
+        container.setAutoStartup(false);
         container.setConnectionFactory(connectionFactory);
         container.addMessageListener(
                 (message, pattern) -> maintenanceService.onSlotReleased(

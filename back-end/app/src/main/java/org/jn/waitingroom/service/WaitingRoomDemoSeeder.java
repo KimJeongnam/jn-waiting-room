@@ -12,8 +12,6 @@ import org.jn.waitingroom.domain.WaitingRequestStatus;
 import org.jn.waitingroom.redis.RedisWaitingRoomStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.ApplicationArguments;
-import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -22,13 +20,14 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 /** 데모 전용 테스트 사용자를 기존 Waiting Room 상태 전이로 생성합니다. */
 @Component
 @Profile("demo")
 @ConditionalOnProperty(prefix = "waiting-room.demo", name = "seed-enabled", havingValue = "true")
-public class WaitingRoomDemoSeeder implements ApplicationRunner {
+public class WaitingRoomDemoSeeder {
     private static final Logger LOGGER = LoggerFactory.getLogger(WaitingRoomDemoSeeder.class);
 
     private final RedisWaitingRoomStore store;
@@ -40,7 +39,7 @@ public class WaitingRoomDemoSeeder implements ApplicationRunner {
      * 데모 시드가 사용할 Redis 저장소와 실행 설정을 주입받습니다.
      *
      * @param store Waiting Room 상태 전이 저장소
-     * @param redis 데모 시드 완료 표식을 저장할 Redis 접근 객체
+     * @param redis reset 요청에서 대상 서비스의 초기 상태를 구성할 Redis 접근 객체
      * @param waitingRoomProperties 대상 서비스의 운영 상태 전이 설정
      * @param demoProperties 데모 테스트 사용자와 만료시간 설정
      */
@@ -56,28 +55,33 @@ public class WaitingRoomDemoSeeder implements ApplicationRunner {
         this.demoProperties = demoProperties;
     }
 
-    /** Spring Boot 시작이 완료된 뒤 데모 테스트 상태를 한 번 구성합니다. */
-    @Override
-    public void run(ApplicationArguments args) {
-        seed();
-    }
-
-    /** 이전 데모 테스트 사용자만 제거한 뒤 동일한 초기 상태를 다시 생성합니다. */
-    void seed() {
+    /** reset 요청에서 대상 서비스의 큐를 초기화하고 데모 테스트 사용자를 동기로 생성합니다. */
+    public void seed() {
         String serviceId = demoProperties.serviceId();
-        resetDemoState(serviceId);
-        var service = serviceProperties(serviceId);
-        String redirectTargetId = service.redirects().keySet().stream()
-                .findFirst()
-                .orElseThrow(() -> new IllegalStateException("데모 대상 서비스의 redirect 설정이 없습니다."));
-        seedActiveUsers(serviceId, redirectTargetId, service);
-        seedWaitingUsers(serviceId, redirectTargetId, service);
-        LOGGER.info(
-                "Demo seed completed for service {}: active={}, waiting={}",
-                serviceId,
-                demoProperties.activeUsers(),
-                demoProperties.waitingUsers()
-        );
+        String leaseToken = UUID.randomUUID().toString();
+        // 같은 서비스의 Scheduler와 다른 reset이 초기화 중인 큐를 변경하지 못하게 합니다.
+        if (!store.tryAcquireMaintenanceLease(serviceId, leaseToken,
+                waitingRoomProperties.heartbeatExpirationRecoveryGrace())) {
+            throw new IllegalStateException("데모 초기화에 필요한 유지보수 lease를 획득할 수 없습니다.");
+        }
+        try {
+            resetDemoState(serviceId);
+            var service = serviceProperties(serviceId);
+            String redirectTargetId = service.redirects().keySet().stream()
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException("데모 대상 서비스의 redirect 설정이 없습니다."));
+            seedActiveUsers(serviceId, redirectTargetId, service);
+            seedWaitingUsers(serviceId, redirectTargetId, service);
+            LOGGER.info(
+                    "Demo seed completed for service {}: active={}, waiting={}",
+                    serviceId,
+                    demoProperties.activeUsers(),
+                    demoProperties.waitingUsers()
+            );
+        } finally {
+            // 만료 후 다른 pass가 얻은 lease는 기존 compare-and-delete 연산으로 보존합니다.
+            store.releaseMaintenanceLease(serviceId, leaseToken);
+        }
     }
 
     /** 대상 서비스의 런타임 큐를 초기화하고 고정된 데모 요청 상태를 제거합니다. */
@@ -86,8 +90,7 @@ public class WaitingRoomDemoSeeder implements ApplicationRunner {
                 "waiting:{%s}".formatted(serviceId),
                 "waiting-heartbeat:{%s}".formatted(serviceId),
                 "active-slots:{%s}".formatted(serviceId),
-                "slot-release-events:{%s}".formatted(serviceId),
-                "maintenance-lease:{%s}".formatted(serviceId)
+                "slot-release-events:{%s}".formatted(serviceId)
         ));
 
         List<String> requestIds = new ArrayList<>(demoProperties.activeUsers() + demoProperties.waitingUsers());

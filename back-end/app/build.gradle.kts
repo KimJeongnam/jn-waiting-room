@@ -31,16 +31,15 @@ dependencies {
 
     implementation("org.springframework.boot:spring-boot-starter-webmvc")
     implementation("org.springframework.boot:spring-boot-starter-validation")
-    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
     implementation("org.springframework.boot:spring-boot-starter-data-redis")
-    implementation("org.springframework.boot:spring-boot-starter-flyway")
-    implementation("org.flywaydb:flyway-database-postgresql")
-
-    runtimeOnly("org.postgresql:postgresql")
+    implementation("org.springframework.boot:spring-boot-starter-security")
+    implementation("org.springframework.boot:spring-boot-starter-oauth2-resource-server")
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
 
     // Use JUnit Jupiter for testing.
     testImplementation(libs.junit.jupiter)
     testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation("org.springframework.boot:spring-boot-starter-webmvc-test")
     // 원자 처리 테스트는 mock 대신 실제 Redis 컨테이너에서 실행합니다.
     testImplementation("org.testcontainers:testcontainers-junit-jupiter:2.0.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
@@ -61,9 +60,34 @@ application {
     mainClass = "org.jn.waitingroom.WaitingRoomApplication"
 }
 
+val frontendDirectory = rootProject.projectDir.resolve("../front-end")
+val frontendPrebuilt = providers.gradleProperty("frontendPrebuilt").map(String::toBoolean).orElse(false)
+
+val frontendBuild by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Builds the production Front unless Docker already supplied dist."
+    workingDir(frontendDirectory)
+    commandLine("bash", "-lc", ". ~/.nvm/nvm.sh && nvm use && pnpm build")
+    enabled = !frontendPrebuilt.get()
+}
+
+val frontendResources by tasks.registering(Sync::class) {
+    dependsOn(frontendBuild)
+    from(frontendDirectory.resolve("dist"))
+    into(layout.buildDirectory.dir("frontend/wwwroot"))
+}
+
 tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
     // 버전과 관계없이 실행 파일 이름을 일정하게 유지합니다.
     archiveFileName = "jn-waiting-room.jar"
+    // processResources와 분리하여 bootRun/test는 production Front를 빌드하지 않습니다.
+    from(frontendResources) {
+        into("BOOT-INF/classes/wwwroot")
+    }
+    val frontendIndex = frontendDirectory.resolve("dist/index.html")
+    doFirst {
+        check(frontendIndex.isFile) { "front-end/dist/index.html is required; build the Front first." }
+    }
 }
 
 tasks.named<Test>("test") {

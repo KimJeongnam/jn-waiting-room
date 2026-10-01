@@ -14,7 +14,7 @@ import {
   Title,
 } from '@mantine/core'
 import { useEffect, useRef, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { useLocation, useNavigate, useSearchParams } from 'react-router'
 
 import { formatEstimatedWaitTime } from './formatEstimatedWaitTime'
 import './WaitingRoomPage.css'
@@ -53,27 +53,30 @@ function retryAfterMs(response: Response) {
 /** 접속 순서를 기다리는 사용자에게 현재 대기 상태를 안내한다. */
 export function WaitingRoomPage() {
   const [searchParams] = useSearchParams()
+  const { hash, pathname, search } = useLocation()
+  const navigate = useNavigate()
   const serviceId = searchParams.get('serviceId')
-  const reservationRequestId = searchParams.get('reservationRequestId')
+  const routeKey = pathname + search
   const [waitingStatus, setWaitingStatus] =
     useState<WaitingStatusResponse | null>(null)
   const initialPosition = useRef<number | null>(null)
+  const readyRouteRef = useRef<string | null>(null)
+  const [readyRoute, setReadyRoute] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [fatalError, setFatalError] = useState<string | null>(null)
   const parameterError =
-    serviceId && reservationRequestId
+    serviceId && (new URLSearchParams(hash.slice(1)).get('token') || readyRoute === routeKey)
       ? null
-      : '대기 요청 정보가 올바르지 않습니다.'
+      : '대기 세션 주소가 올바르지 않습니다. 새 대기 주소로 다시 접속해 주세요.'
 
   useEffect(() => {
-    if (!serviceId || !reservationRequestId) {
-      return
-    }
     const targetServiceId = serviceId
-    const targetReservationRequestId = reservationRequestId
 
     let cancelled = false
     let timer: number | undefined
     let inFlight = false
+    let sessionReady = false
+    const controller = new AbortController()
 
     /** 기존 예약을 교체하고 지정된 시간 뒤 한 번만 상태를 조회한다. */
     function schedulePoll(delayMs: number) {
@@ -93,12 +96,21 @@ export function WaitingRoomPage() {
       }
       inFlight = true
       try {
-        const query = new URLSearchParams({
-          serviceId: targetServiceId,
-          reservationRequestId: targetReservationRequestId,
+        const response = await fetch('/api/v1/waiting-session', {
+          credentials: 'same-origin',
+          headers: { 'X-Waiting-Request': '1' },
+          signal: controller.signal,
         })
-        const response = await fetch(`/api/v1/waiting-session?${query}`)
         if (!response.ok) {
+          if (response.status === 401) {
+            if (!cancelled) {
+              sessionReady = false
+              readyRouteRef.current = null
+              setReadyRoute(null)
+              setFatalError('대기 세션이 유효하지 않습니다. 새 대기 주소로 다시 접속해 주세요.')
+            }
+            return
+          }
           if (response.status === 429 || response.status === 503) {
             if (!cancelled) {
               setError(null)
@@ -123,9 +135,9 @@ export function WaitingRoomPage() {
         setWaitingStatus(result)
         setError(null)
 
-        if (result.status === 'ADMITTED') {
+        if (result.status === 'ADMITTED' || result.status === 'ENTERED') {
           if (result.redirectUrl) {
-            globalThis.location.assign(result.redirectUrl)
+            globalThis.location.replace(result.redirectUrl)
           } else {
             setError('입장할 서비스 주소를 받지 못했습니다.')
           }
@@ -149,9 +161,44 @@ export function WaitingRoomPage() {
       }
     }
 
+    /** 일회용 URL token을 cookie 세션으로 교환한 뒤 fragment를 지운다. */
+    async function exchangeSession() {
+      const token = new URLSearchParams(hash.slice(1)).get('token')
+      if (!targetServiceId || !token) {
+        return
+      }
+      try {
+        const response = await fetch('/api/v1/waiting-session', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Waiting-Request': '1',
+          },
+          body: JSON.stringify({ serviceId: targetServiceId, token }),
+          signal: controller.signal,
+        })
+        if (cancelled) {
+          return
+        }
+        if (!response.ok) {
+          setFatalError('대기 세션을 시작하지 못했습니다. 새 대기 주소로 다시 접속해 주세요.')
+          return
+        }
+        readyRouteRef.current = routeKey
+        setReadyRoute(routeKey)
+        globalThis.history.replaceState(globalThis.history.state, '', routeKey)
+        navigate({ pathname, search, hash: '' }, { replace: true })
+      } catch (requestError) {
+        if (!cancelled && !(requestError instanceof Error && requestError.name === 'AbortError')) {
+          setFatalError('대기 세션을 시작하지 못했습니다. 새 대기 주소로 다시 접속해 주세요.')
+        }
+      }
+    }
+
     /** 백그라운드에서 복귀하면 예약된 timer 대신 즉시 최신 상태를 조회한다. */
     function pollWhenVisible() {
-      if (document.visibilityState === 'visible' && !inFlight) {
+      if (sessionReady && document.visibilityState === 'visible' && !inFlight) {
         if (timer !== undefined) {
           globalThis.clearTimeout(timer)
           timer = undefined
@@ -161,16 +208,32 @@ export function WaitingRoomPage() {
     }
 
     document.addEventListener('visibilitychange', pollWhenVisible)
-    // 개발 모드 StrictMode의 첫 effect가 정리된 뒤 실제 최초 조회를 한 번만 실행합니다.
-    globalThis.queueMicrotask(() => void poll())
+    // StrictMode의 첫 effect가 정리된 뒤 token 교환을 한 번만 시작합니다.
+    globalThis.queueMicrotask(() => {
+      if (!cancelled) {
+        setWaitingStatus(null)
+        initialPosition.current = null
+        setError(null)
+        setFatalError(null)
+        if (new URLSearchParams(hash.slice(1)).get('token')) {
+          readyRouteRef.current = null
+          setReadyRoute(null)
+          void exchangeSession()
+        } else if (readyRouteRef.current === routeKey) {
+          sessionReady = true
+          void poll()
+        }
+      }
+    })
     return () => {
       cancelled = true
+      controller.abort()
       document.removeEventListener('visibilitychange', pollWhenVisible)
       if (timer !== undefined) {
         globalThis.clearTimeout(timer)
       }
     }
-  }, [reservationRequestId, serviceId])
+  }, [hash, navigate, pathname, routeKey, search, serviceId])
 
   /** 현재 페이지에서 처음 확인한 순번 대비 감소한 비율을 표시한다. */
   const progress =
@@ -187,10 +250,13 @@ export function WaitingRoomPage() {
           ),
         )
       : 0
-  const terminal =
+  const accessError = fatalError ?? parameterError
+  const terminal = Boolean(accessError) ||
     waitingStatus?.status === 'EXPIRED' || waitingStatus?.status === 'CANCELLED'
-  const title = terminal
-    ? waitingStatus.status === 'EXPIRED'
+  const title = accessError
+    ? '대기 세션을 시작할 수 없습니다.'
+    : terminal
+    ? waitingStatus?.status === 'EXPIRED'
       ? '대기 요청이 만료되었습니다.'
       : '대기 요청이 취소되었습니다.'
     : '사용자가 많아 접속 대기중입니다.'
@@ -215,7 +281,7 @@ export function WaitingRoomPage() {
               {title}
             </Title>
 
-            <Stack className="queue-stats" gap="xl" role="status">
+            {!accessError && <Stack className="queue-stats" gap="xl" role="status">
               <Stack align="center" className="queue-stat" gap={0}>
                 <Text c="dimmed" fw={500}>
                   대기 인원
@@ -250,15 +316,15 @@ export function WaitingRoomPage() {
                       )}
                 </Text>
               </Stack>
-            </Stack>
+            </Stack>}
 
-            <Text c="dimmed" className="queue-warning" size="sm" ta="center">
+            {!accessError && <Text c="dimmed" className="queue-warning" size="sm" ta="center">
               {terminal
-                ? waitingStatus.expirationReason
+                ? waitingStatus?.expirationReason
                 : '대기 상태를 유지하려면 이 페이지를 열어두세요.'}
-            </Text>
-            {(error ?? parameterError) && (
-              <Text role="alert">{error ?? parameterError}</Text>
+            </Text>}
+            {(accessError ?? error) && (
+              <Text role="alert">{accessError ?? error}</Text>
             )}
           </Stack>
         </Paper>

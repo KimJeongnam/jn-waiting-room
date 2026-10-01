@@ -1,0 +1,12 @@
+<component name="ProjectRunConfigurationManager">
+  <!-- Run all frontend Vitest tests in IntelliJ's test runner tree. -->
+  <configuration default="false" name="Frontend Tests" type="JavaScriptTestRunnerVitest">
+    <config value="$PROJECT_DIR$/front-end/vite.config.ts" />
+    <node-interpreter value="project" />
+    <vitest-package value="$PROJECT_DIR$/front-end/node_modules/vitest" />
+    <working-dir value="$PROJECT_DIR$/front-end" />
+    <envs />
+    <scope-kind value="ALL" />
+    <method v="2" />
+  </configuration>
+</component>

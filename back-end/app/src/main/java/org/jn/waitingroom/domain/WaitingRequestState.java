@@ -22,7 +22,10 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  * @param completedAt 대상 서비스 이용이 정상 완료된 Unix epoch milliseconds
  * @param expiredAt 대기 또는 활성 슬롯이 만료된 Unix epoch milliseconds
  * @param expirationReason 요청이 만료된 원인
- * @param nextPollAllowedAt 다음 상태조회를 허용하는 Unix epoch milliseconds
+ * @param nextPollAllowedAt 기존 내부 조회의 허용 시각 (Browser 조회 제한은 세션에 저장)
+ * @param currentWaitingTokenHash 현재 일회용 접근 토큰의 SHA-256 해시
+ * @param currentWaitingSessionHash 현재 Browser 세션의 SHA-256 해시
+ * @param waitingSessionVersion 재발급 시 증가하는 접근 자격 버전
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record WaitingRequestState(
@@ -37,6 +40,9 @@ public record WaitingRequestState(
         Long completedAt,
         Long expiredAt,
         String expirationReason,
-        Long nextPollAllowedAt
+        Long nextPollAllowedAt,
+        String currentWaitingTokenHash,
+        String currentWaitingSessionHash,
+        Long waitingSessionVersion
 ) {
 }

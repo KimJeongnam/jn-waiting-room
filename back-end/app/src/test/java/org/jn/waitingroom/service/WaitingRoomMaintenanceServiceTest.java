@@ -12,6 +12,7 @@ import org.jn.waitingroom.redis.RedisWaitingRoomStore;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -29,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 @Testcontainers
+@DisplayName("대기열 유지보수와 만료 처리 테스트")
 class WaitingRoomMaintenanceServiceTest {
     private static final String SERVICE_ID = "reservation-service";
 
@@ -62,6 +64,8 @@ class WaitingRoomMaintenanceServiceTest {
         }
     }
 
+    /** 검증 목적: 설정된 활성 슬롯 수까지만 대기 신청을 입장시킨다. */
+    @DisplayName("설정된 활성 슬롯 수까지만 대기 신청을 입장시킨다")
     @Test
     void fillsOnlyTheConfiguredNumberOfActiveSlots() {
         register("reservation-1");
@@ -76,6 +80,70 @@ class WaitingRoomMaintenanceServiceTest {
         assertEquals(2, redis.opsForZSet().size("active-slots:{reservation-service}"));
     }
 
+    /** 정상 lease 작업이 끝나야 다른 인스턴스가 참고할 유지보수 heartbeat를 남깁니다. */
+    @DisplayName("유지보수 성공 시 만료 시간이 있는 공유 하트비트를 기록한다")
+    @Test
+    void successfulMaintenanceRecordsASharedHeartbeatWithExpiration() {
+        maintenance(properties(1, Duration.ofMinutes(20), Duration.ofMinutes(2))).maintain(SERVICE_ID);
+
+        assertNotNull(redis.opsForValue().get("maintenance-heartbeat:{reservation-service}"));
+        org.junit.jupiter.api.Assertions.assertTrue(
+                redis.getExpire("maintenance-heartbeat:{reservation-service}") > 0);
+    }
+
+    /** 동일 프로세스의 두 pass도 lease 세대가 달라야 이전 pass가 새 lease를 건드리지 않습니다. */
+    @DisplayName("만료된 작업은 다음 작업의 임대를 해제하거나 하트비트를 쓸 수 없다")
+    @Test
+    void expiredPassOfTheSameInstanceCannotWriteHeartbeatOrReleaseTheNextPassLease() throws Exception {
+        String leaseKey = "maintenance-lease:{reservation-service}";
+        var firstEntered = new java.util.concurrent.CountDownLatch(1);
+        var secondEntered = new java.util.concurrent.CountDownLatch(1);
+        var releaseFirst = new java.util.concurrent.CountDownLatch(1);
+        var releaseSecond = new java.util.concurrent.CountDownLatch(1);
+        var passes = new java.util.concurrent.atomic.AtomicInteger();
+        var controlledStore = org.mockito.Mockito.spy(store);
+        org.mockito.Mockito.doAnswer(call -> {
+            int pass = passes.incrementAndGet();
+            (pass == 1 ? firstEntered : secondEntered).countDown();
+            org.junit.jupiter.api.Assertions.assertTrue((pass == 1 ? releaseFirst : releaseSecond)
+                    .await(5, java.util.concurrent.TimeUnit.SECONDS));
+            return call.callRealMethod();
+        }).when(controlledStore).activeExpirationCandidates(org.mockito.ArgumentMatchers.eq(SERVICE_ID),
+                org.mockito.ArgumentMatchers.anyInt());
+        var coordinator = org.mockito.Mockito.mock(WaitingRoomRecoveryCoordinator.class);
+        org.mockito.Mockito.when(coordinator.isAvailable()).thenReturn(true);
+        var maintenance = new WaitingRoomMaintenanceService(controlledStore,
+                properties(1, Duration.ofMinutes(20), Duration.ofMinutes(2)), coordinator, "same-instance");
+
+        try (var executor = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var first = executor.submit(() -> maintenance.maintain(SERVICE_ID));
+            try {
+                org.junit.jupiter.api.Assertions.assertTrue(firstEntered.await(5, java.util.concurrent.TimeUnit.SECONDS));
+                String firstToken = redis.opsForValue().get(leaseKey);
+                redis.expire(leaseKey, Duration.ZERO);
+                var second = executor.submit(() -> maintenance.maintain(SERVICE_ID));
+                org.junit.jupiter.api.Assertions.assertTrue(secondEntered.await(5, java.util.concurrent.TimeUnit.SECONDS));
+                String secondToken = redis.opsForValue().get(leaseKey);
+                releaseFirst.countDown();
+                first.get(5, java.util.concurrent.TimeUnit.SECONDS);
+
+                org.junit.jupiter.api.Assertions.assertAll(
+                        () -> org.junit.jupiter.api.Assertions.assertNotEquals(firstToken, secondToken),
+                        () -> assertNull(redis.opsForValue().get("maintenance-heartbeat:{reservation-service}")),
+                        () -> assertEquals(secondToken, redis.opsForValue().get(leaseKey)));
+                releaseSecond.countDown();
+                second.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                assertNotNull(redis.opsForValue().get("maintenance-heartbeat:{reservation-service}"));
+                assertNull(redis.opsForValue().get(leaseKey));
+            } finally {
+                releaseFirst.countDown();
+                releaseSecond.countDown();
+            }
+        }
+    }
+
+    /** 검증 목적: 자동 유지보수는 애플리케이션 기동 완료까지 기다린다. */
+    @DisplayName("자동 유지보수는 애플리케이션 기동 완료까지 기다린다")
     @Test
     void automaticMaintenanceWaitsUntilApplicationStartupIsComplete() {
         register("reservation-1");
@@ -91,6 +159,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertEquals(WaitingRequestStatus.ADMITTED, store.find(SERVICE_ID, "reservation-1").status());
     }
 
+    /** 검증 목적: 입장 허용 슬롯이 만료되면 다음 신청을 입장시킨다. */
+    @DisplayName("입장 허용 슬롯이 만료되면 다음 신청을 입장시킨다")
     @Test
     void expiresAnAdmissionSlotAndAdmitsTheNextRequest() throws InterruptedException {
         register("reservation-1");
@@ -108,6 +178,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertEquals(1, redis.opsForZSet().size("slot-release-events:{reservation-service}"));
     }
 
+    /** 검증 목적: 대기 하트비트가 중단되면 신청을 만료한다. */
+    @DisplayName("대기 하트비트가 중단되면 신청을 만료한다")
     @Test
     void expiresAWaitingRequestWhenItsHeartbeatStops() throws InterruptedException {
         register("reservation-1");
@@ -122,6 +194,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertEquals(0, redis.opsForZSet().size("waiting:{reservation-service}"));
     }
 
+    /** 검증 목적: 입장 완료 세션 제한 시간이 지나면 신청을 만료한다. */
+    @DisplayName("입장 완료 세션 제한 시간이 지나면 신청을 만료한다")
     @Test
     void expiresAnEnteredRequestWhenItsSessionLimitPasses() throws InterruptedException {
         register("reservation-1");
@@ -138,6 +212,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertEquals(0, redis.opsForZSet().size("active-slots:{reservation-service}"));
     }
 
+    /** 검증 목적: 최대 대기시간이 지나면 신청을 만료한다. */
+    @DisplayName("최대 대기시간이 지나면 신청을 만료한다")
     @Test
     void expiresAWaitingRequestWhenItsMaximumWaitPasses() throws InterruptedException {
         register("reservation-1");
@@ -157,6 +233,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertEquals(0, redis.opsForZSet().size("waiting:{reservation-service}"));
     }
 
+    /** 검증 목적: 정보가 없는 대기열 선두를 제거하고 다음 신청을 입장시킨다. */
+    @DisplayName("정보가 없는 대기열 선두를 제거하고 다음 신청을 입장시킨다")
     @Test
     void removesAnOrphanedQueueHeadAndAdmitsTheNextWaitingRequest() {
         register("reservation-1");
@@ -170,6 +248,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertNull(redis.opsForZSet().rank("waiting-heartbeat:{reservation-service}", "reservation-1"));
     }
 
+    /** 검증 목적: 손상된 만료 대기열 선두를 격리하고 다음 신청을 입장시킨다. */
+    @DisplayName("손상된 만료 대기열 선두를 격리하고 다음 신청을 입장시킨다")
     @Test
     void quarantinesACorruptedExpiredQueueHeadAndAdmitsTheNextWaitingRequest() {
         register("reservation-1");
@@ -205,6 +285,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertEquals("invalid-json", redis.opsForValue().get(quarantineKey));
     }
 
+    /** 검증 목적: 손상된 만료 활성 슬롯을 격리하고 다음 신청을 입장시킨다. */
+    @DisplayName("손상된 만료 활성 슬롯을 격리하고 다음 신청을 입장시킨다")
     @Test
     void quarantinesACorruptedExpiredActiveSlotAndAdmitsTheNextWaitingRequest() throws InterruptedException {
         register("reservation-1");
@@ -227,6 +309,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertNull(redis.opsForZSet().rank("active-slots:{reservation-service}", "reservation-1"));
     }
 
+    /** 검증 목적: 구조가 잘못된 JSON을 격리하고 다음 신청을 입장시킨다. */
+    @DisplayName("구조가 잘못된 JSON을 격리하고 다음 신청을 입장시킨다")
     @Test
     void quarantinesStructurallyInvalidJsonAndAdmitsTheNextWaitingRequest() {
         register("reservation-1");
@@ -252,6 +336,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertEquals("{}", redis.opsForValue().get(quarantineKey));
     }
 
+    /** 검증 목적: 이동 주소가 없는 대기 상태를 격리하고 다음 신청을 입장시킨다. */
+    @DisplayName("이동 주소가 없는 대기 상태를 격리하고 다음 신청을 입장시킨다")
     @Test
     void quarantinesWaitingStateWithoutRedirectTargetAndAdmitsTheNextWaitingRequest() {
         register("reservation-1");
@@ -271,6 +357,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertEquals(WaitingRequestStatus.ADMITTED, store.find(SERVICE_ID, "reservation-2").status());
     }
 
+    /** 검증 목적: 알 수 없는 상태를 격리하고 다음 신청을 입장시킨다. */
+    @DisplayName("알 수 없는 상태를 격리하고 다음 신청을 입장시킨다")
     @Test
     void quarantinesUnknownStatusAndAdmitsTheNextWaitingRequest() {
         register("reservation-1");
@@ -291,6 +379,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertEquals(WaitingRequestStatus.ADMITTED, store.find(SERVICE_ID, "reservation-2").status());
     }
 
+    /** 검증 목적: 선택 필드의 자료형이 잘못되면 격리하고 다음 신청을 입장시킨다. */
+    @DisplayName("선택 필드의 자료형이 잘못되면 격리하고 다음 신청을 입장시킨다")
     @Test
     void quarantinesInvalidOptionalFieldTypeAndAdmitsTheNextWaitingRequest() {
         register("reservation-1");
@@ -312,6 +402,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertEquals(WaitingRequestStatus.ADMITTED, store.find(SERVICE_ID, "reservation-2").status());
     }
 
+    /** 검증 목적: 일치하지 않는 대기열 멤버십을 제거하고 다음 신청을 입장시킨다. */
+    @DisplayName("일치하지 않는 대기열 멤버십을 제거하고 다음 신청을 입장시킨다")
     @Test
     void removesMismatchedQueueMembershipAndAdmitsTheNextWaitingRequest() {
         register("reservation-1");
@@ -334,6 +426,8 @@ class WaitingRoomMaintenanceServiceTest {
         assertNull(redis.opsForZSet().rank("waiting-heartbeat:{reservation-service}", "reservation-1"));
     }
 
+    /** 검증 목적: 하트비트가 없는 대기 신청을 만료하고 다음 신청을 입장시킨다. */
+    @DisplayName("하트비트가 없는 대기 신청을 만료하고 다음 신청을 입장시킨다")
     @Test
     void expiresAWaitingRequestWithoutHeartbeatAndAdmitsTheNextWaitingRequest() {
         register("reservation-1");
@@ -350,7 +444,10 @@ class WaitingRoomMaintenanceServiceTest {
     }
 
     private WaitingRoomMaintenanceService maintenance(WaitingRoomProperties properties) {
-        return new WaitingRoomMaintenanceService(store, properties, "test-instance");
+        // 기존 만료 테스트는 recovery barrier와 분리해 lease 안의 유지보수 업무를 검증합니다.
+        var coordinator = org.mockito.Mockito.mock(WaitingRoomRecoveryCoordinator.class);
+        org.mockito.Mockito.when(coordinator.isAvailable()).thenReturn(true);
+        return new WaitingRoomMaintenanceService(store, properties, coordinator, "test-instance");
     }
 
     private WaitingRoomProperties properties(

@@ -8,6 +8,7 @@ package org.jn.waitingroom.service;
 
 import org.jn.waitingroom.config.WaitingRoomProperties;
 import org.jn.waitingroom.domain.WaitingRequestStatus;
+import org.jn.waitingroom.domain.WaitingSecret;
 import org.jn.waitingroom.redis.RedisWaitingRoomStore;
 import org.springframework.stereotype.Service;
 import org.springframework.web.util.UriComponentsBuilder;
@@ -27,16 +28,23 @@ import java.util.Objects;
 public class WaitingRoomService {
     private final RedisWaitingRoomStore store;
     private final WaitingRoomProperties properties;
+    private final WaitingRoomRecoveryCoordinator coordinator;
+    private final RedisOperationalSafety redisSafety;
 
     /**
      * 필요한 저장소와 서비스별 설정을 주입받습니다.
      *
      * @param store Redis 대기 상태 저장소
      * @param properties Waiting Room 설정
+     * @param coordinator Redis 복구 완료 gate
+     * @param redisSafety 운영 Redis 정책과 새 등록 용량 gate
      */
-    public WaitingRoomService(RedisWaitingRoomStore store, WaitingRoomProperties properties) {
+    public WaitingRoomService(RedisWaitingRoomStore store, WaitingRoomProperties properties,
+                              WaitingRoomRecoveryCoordinator coordinator, RedisOperationalSafety redisSafety) {
         this.store = Objects.requireNonNull(store);
         this.properties = Objects.requireNonNull(properties);
+        this.coordinator = Objects.requireNonNull(coordinator);
+        this.redisSafety = Objects.requireNonNull(redisSafety);
     }
 
     /**
@@ -48,6 +56,8 @@ public class WaitingRoomService {
      * @return 등록 결과와 Browser 대기 URL
      */
     public Registration register(String serviceId, String reservationRequestId, String redirectTargetId) {
+        coordinator.requireAvailable();
+        redisSafety.requireRegistrationCapacity();
         requireText(reservationRequestId, "Idempotency-Key");
         requireText(redirectTargetId, "redirectTargetId");
         var service = service(serviceId);
@@ -56,12 +66,15 @@ public class WaitingRoomService {
         }
 
         String fingerprint = fingerprint(serviceId, redirectTargetId);
+        String token = WaitingSecret.generate();
         var result = store.register(
                 serviceId,
                 reservationRequestId,
                 fingerprint,
                 redirectTargetId,
-                service.requestTtl()
+                service.requestTtl(),
+                WaitingSecret.hash(token),
+                service.waitingTokenTtl()
         );
         if (result.type() == RedisWaitingRoomStore.ResultType.STORE_ERROR) {
             throw new IllegalStateException("Redis 대기 요청 상태가 올바르지 않습니다.");
@@ -70,7 +83,7 @@ public class WaitingRoomService {
         String waitingUrl = result.type() == RedisWaitingRoomStore.ResultType.CREATED
                 ? UriComponentsBuilder.fromPath("/waiting")
                         .queryParam("serviceId", serviceId)
-                        .queryParam("reservationRequestId", reservationRequestId)
+                        .fragment("token=" + token)
                         .build()
                         .encode()
                         .toUriString()
@@ -81,11 +94,25 @@ public class WaitingRoomService {
     /**
      * 현재 요청 상태와 대기 순번을 조회합니다.
      *
-     * @param serviceId 대상 서비스 식별자
-     * @param reservationRequestId 대기 신청 식별자
+     * @param cookie 서비스 식별자와 난수 세션 비밀값을 포함하는 cookie
      * @return Front Polling 응답에 필요한 현재 상태
      */
-    public WaitingStatus poll(String serviceId, String reservationRequestId) {
+    public WaitingStatus poll(String cookie) {
+        coordinator.requireAvailable();
+        if (cookie == null) throw new WaitingSessionInvalidException();
+        String[] parts = cookie.split("\\.", -1);
+        if (parts.length != 2 || !properties.services().containsKey(parts[0])
+                || !parts[1].matches("[A-Za-z0-9_-]{43}")) {
+            throw new WaitingSessionInvalidException();
+        }
+        String serviceId = parts[0];
+        String sessionHash = WaitingSecret.hash(parts[1]);
+        var session = store.findSession(serviceId, sessionHash);
+        if (session == null || !serviceId.equals(session.serviceId())
+                || session.reservationRequestId() == null || session.reservationRequestId().isBlank()) {
+            throw new WaitingSessionInvalidException();
+        }
+        String reservationRequestId = session.reservationRequestId();
         var service = service(serviceId);
         var snapshot = store.poll(
                 serviceId,
@@ -102,10 +129,12 @@ public class WaitingRoomService {
                 service.etaMinObservation(),
                 service.etaInitialReleaseRatePerSecond(),
                 properties.maxAdmissionsPerRun(),
-                properties.schedulerInterval()
+                properties.schedulerInterval(),
+                sessionHash
         );
-        if (snapshot.type() == RedisWaitingRoomStore.ResultType.NOT_FOUND) {
-            throw new NoSuchElementException("대기 신청을 찾을 수 없습니다.");
+        if (snapshot.type() == RedisWaitingRoomStore.ResultType.NOT_FOUND
+                || snapshot.type() == RedisWaitingRoomStore.ResultType.INVALID_SESSION) {
+            throw new WaitingSessionInvalidException();
         }
         if (snapshot.type() == RedisWaitingRoomStore.ResultType.STORE_ERROR) {
             throw new IllegalStateException("Redis 대기 요청 상태가 올바르지 않습니다.");
@@ -115,7 +144,9 @@ public class WaitingRoomService {
         }
 
         var state = snapshot.state();
+        // 입장 완료 뒤 새로고침한 세션도 저장된 목적지로 복귀할 수 있습니다.
         String redirectUrl = state.status() == WaitingRequestStatus.ADMITTED
+                || state.status() == WaitingRequestStatus.ENTERED
                 ? redirectUrl(service, state.redirectTargetId(), state.reservationRequestId())
                 : null;
         Long nextPollAfterMs = state.status() == WaitingRequestStatus.WAITING
@@ -133,6 +164,38 @@ public class WaitingRoomService {
         );
     }
 
+    /** 일회용 토큰을 소비하고 Browser에 한 번 전달할 세션 cookie 값을 생성합니다. */
+    public String exchangeToken(String serviceId, String token) {
+        coordinator.requireAvailable();
+        if (serviceId == null || !properties.services().containsKey(serviceId) || token == null
+                || !token.matches("[A-Za-z0-9_-]{43}")) {
+            throw new WaitingSessionInvalidException();
+        }
+        String sessionSecret = WaitingSecret.generate();
+        var settings = service(serviceId);
+        var result = store.consumeToken(serviceId, WaitingSecret.hash(token), WaitingSecret.hash(sessionSecret),
+                settings.heartbeatTimeout(), settings.maxWaitDuration(), settings.etaWindow());
+        if (result.type() != RedisWaitingRoomStore.ResultType.APPLIED) {
+            throw new WaitingSessionInvalidException();
+        }
+        // 공개 serviceId로 Redis hash slot을 찾으며 비밀값과의 연결은 Lua가 검증합니다.
+        return serviceId + "." + sessionSecret;
+    }
+
+    /** Backend이 소유권 검증 후 요청한 새 일회용 접근 URL을 반환합니다. */
+    public Registration issueToken(String serviceId, String reservationRequestId) {
+        coordinator.requireAvailable();
+        var settings = service(serviceId);
+        String token = WaitingSecret.generate();
+        var result = requireTransitionResult(store.issueToken(serviceId, reservationRequestId,
+                WaitingSecret.hash(token), settings.waitingTokenTtl(), settings.heartbeatTimeout(),
+                settings.maxWaitDuration(), settings.etaWindow()));
+        String url = result.type() == RedisWaitingRoomStore.ResultType.APPLIED
+                ? UriComponentsBuilder.fromPath("/waiting").queryParam("serviceId", serviceId)
+                        .fragment("token=" + token).build().encode().toUriString() : null;
+        return new Registration(result.type(), result.state().status(), url);
+    }
+
     /**
      * 입장 허용 요청을 실제 서비스 입장 상태로 전환합니다.
      *
@@ -141,6 +204,7 @@ public class WaitingRoomService {
      * @return 상태 전이 결과와 서비스 이용 만료시각
      */
     public Transition enter(String serviceId, String reservationRequestId) {
+        coordinator.requireAvailable();
         var service = service(serviceId);
         var result = requireTransitionResult(store.enter(
                 serviceId,
@@ -162,6 +226,7 @@ public class WaitingRoomService {
      * @return 완료 처리 또는 멱등 재호출 결과
      */
     public Transition complete(String serviceId, String reservationRequestId) {
+        coordinator.requireAvailable();
         var service = service(serviceId);
         var result = requireTransitionResult(store.complete(serviceId, reservationRequestId, service.etaWindow()));
         return new Transition(result.type(), result.state(), null);
@@ -175,6 +240,7 @@ public class WaitingRoomService {
      * @return 취소 처리 또는 멱등 재호출 결과
      */
     public Transition cancel(String serviceId, String reservationRequestId) {
+        coordinator.requireAvailable();
         var service = service(serviceId);
         var result = requireTransitionResult(store.cancel(serviceId, reservationRequestId, service.etaWindow()));
         return new Transition(result.type(), result.state(), null);
@@ -245,6 +311,11 @@ public class WaitingRoomService {
             WaitingRequestStatus status,
             String waitingUrl
     ) {
+        /** 업무 결과를 진단할 때도 접근 URL의 토큰 원문은 노출하지 않습니다. */
+        @Override
+        public String toString() {
+            return "Registration[resultType=" + resultType + ", status=" + status + ", waitingUrl=redacted]";
+        }
     }
 
     /**
@@ -256,7 +327,7 @@ public class WaitingRoomService {
      * @param waitingCount 전체 대기 인원
      * @param estimatedWaitSeconds 예상 대기시간이며 계산 근거가 없으면 {@code null}
      * @param nextPollAfterMs 다음 상태조회까지 기다릴 milliseconds
-     * @param redirectUrl 입장 허용 시 이동할 대상 URL
+     * @param redirectUrl 입장 허용 또는 입장 완료 시 이동할 대상 URL
      * @param expirationReason 만료 상태의 원인
      */
     public record WaitingStatus(

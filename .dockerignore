@@ -1,0 +1,12 @@
+.git
+.idea
+**/node_modules
+**/dist
+**/.gradle
+**/build
+**/out
+**/*.log
+**/.env
+**/.env.*
+**/application-local.*
+docs

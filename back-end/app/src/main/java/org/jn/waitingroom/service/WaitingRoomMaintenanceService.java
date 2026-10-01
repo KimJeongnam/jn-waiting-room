@@ -32,6 +32,7 @@ public class WaitingRoomMaintenanceService {
 
     private final RedisWaitingRoomStore store;
     private final WaitingRoomProperties properties;
+    private final WaitingRoomRecoveryCoordinator coordinator;
     private final String instanceId;
     private volatile boolean applicationReady;
 
@@ -40,10 +41,12 @@ public class WaitingRoomMaintenanceService {
      *
      * @param store Redis 대기 상태 저장소
      * @param properties Waiting Room 설정
+     * @param coordinator Redis 복구 완료 gate
      */
     @Autowired
-    public WaitingRoomMaintenanceService(RedisWaitingRoomStore store, WaitingRoomProperties properties) {
-        this(store, properties, UUID.randomUUID().toString());
+    public WaitingRoomMaintenanceService(RedisWaitingRoomStore store, WaitingRoomProperties properties,
+                                         WaitingRoomRecoveryCoordinator coordinator) {
+        this(store, properties, coordinator, UUID.randomUUID().toString());
     }
 
     /**
@@ -51,15 +54,18 @@ public class WaitingRoomMaintenanceService {
      *
      * @param store Redis 대기 상태 저장소
      * @param properties Waiting Room 설정
+     * @param coordinator Redis 복구 완료 gate
      * @param instanceId 현재 프로세스의 lease 소유자 식별자
      */
     WaitingRoomMaintenanceService(
             RedisWaitingRoomStore store,
             WaitingRoomProperties properties,
+            WaitingRoomRecoveryCoordinator coordinator,
             String instanceId
     ) {
         this.store = Objects.requireNonNull(store);
         this.properties = Objects.requireNonNull(properties);
+        this.coordinator = Objects.requireNonNull(coordinator);
         this.instanceId = Objects.requireNonNull(instanceId);
     }
 
@@ -68,14 +74,15 @@ public class WaitingRoomMaintenanceService {
      */
     @Scheduled(fixedDelayString = "${waiting-room.scheduler-interval:PT1S}")
     public void maintainAll() {
-        if (!applicationReady) {
+        if (!applicationReady || !coordinator.isAvailable()) {
             return;
         }
         for (String serviceId : properties.services().keySet()) {
             try {
                 maintain(serviceId);
             } catch (RuntimeException exception) {
-                // 한 서비스의 저장소 오류가 다른 서비스의 슬롯 보충까지 중단시키지 않게 격리합니다.
+                coordinator.markRedisUnavailable();
+                // 스케줄러 스레드를 유지하고 다음 복구 probe가 가용 상태를 회복하도록 합니다.
                 LOGGER.error("Waiting Room 유지보수에 실패했습니다. serviceId={}", serviceId, exception);
             }
         }
@@ -87,13 +94,28 @@ public class WaitingRoomMaintenanceService {
      * @param serviceId 유지보수를 실행할 대상 서비스 식별자
      */
     public void maintain(String serviceId) {
+        if (!coordinator.isAvailable()) {
+            return;
+        }
         var service = properties.services().get(serviceId);
         if (service == null) {
             return;
         }
+        try {
+            maintainUnderLease(serviceId, service);
+        } catch (RuntimeException exception) {
+            // Pub/Sub와 scheduler 모두 동일하게 장애를 기록하고 다음 recovery probe를 기다립니다.
+            coordinator.markRedisUnavailable();
+            LOGGER.error("Waiting Room 유지보수에 실패했습니다. serviceId={}", serviceId, exception);
+        }
+    }
+
+    private void maintainUnderLease(String serviceId, WaitingRoomProperties.ServiceProperties service) {
+        // 동일 인스턴스의 scheduler/Pub/Sub 재획득도 이전 pass와 구분해 ABA를 막습니다.
+        String leaseToken = instanceId + ":" + UUID.randomUUID();
         if (!store.tryAcquireMaintenanceLease(
                 serviceId,
-                instanceId,
+                leaseToken,
                 properties.maintenanceLeaseTimeout()
         )) {
             return;
@@ -103,8 +125,12 @@ public class WaitingRoomMaintenanceService {
             expireActiveSlots(serviceId);
             expireWaitingRequests(serviceId, service);
             admitWaitingRequests(serviceId, service);
+            // lease 소유자가 정상 작업을 마친 경우에만 공유 복구 상태를 갱신합니다.
+            if (!store.recordMaintenanceHeartbeat(serviceId, leaseToken, properties.maintenanceHealthTimeout())) {
+                throw new IllegalStateException("유지보수 lease 소유권이 만료되어 heartbeat를 기록할 수 없습니다.");
+            }
         } finally {
-            store.releaseMaintenanceLease(serviceId, instanceId);
+            store.releaseMaintenanceLease(serviceId, leaseToken);
         }
     }
 
@@ -114,7 +140,7 @@ public class WaitingRoomMaintenanceService {
      * @param channel Redis가 전달한 슬롯 반환 채널명
      */
     public void onSlotReleased(String channel) {
-        if (!applicationReady
+        if (!applicationReady || !coordinator.isAvailable()
                 || !channel.startsWith(SLOT_RELEASED_CHANNEL_PREFIX)
                 || !channel.endsWith("}")) {
             return;

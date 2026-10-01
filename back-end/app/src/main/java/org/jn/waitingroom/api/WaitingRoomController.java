@@ -7,13 +7,21 @@
 package org.jn.waitingroom.api;
 
 import jakarta.validation.Valid;
+import jakarta.servlet.http.HttpServletRequest;
+import org.jn.waitingroom.service.WaitingSessionInvalidException;
 import org.jn.waitingroom.vo.*;
 import org.jn.waitingroom.redis.RedisWaitingRoomStore;
 import org.jn.waitingroom.service.PollingRateLimitException;
+import org.jn.waitingroom.service.WaitingClientAuthorization;
 import org.jn.waitingroom.service.WaitingRoomService;
+import org.jn.waitingroom.service.WaitingRoomRecoveryCoordinator;
+import org.jn.waitingroom.service.RedisOperationalSafety;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.ResponseCookie;
+import org.springframework.dao.DataAccessException;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.ServletRequestBindingException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -25,10 +33,12 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.util.WebUtils;
 
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.UUID;
+import java.net.URI;
 
 /**
  * Waiting Room 외부 HTTP 계약을 Spring MVC endpoint로 노출합니다.
@@ -37,14 +47,21 @@ import java.util.UUID;
 @RequestMapping("/api/v1")
 public class WaitingRoomController {
     private final WaitingRoomService service;
+    private final WaitingClientAuthorization authorization;
+    private final WaitingRoomRecoveryCoordinator coordinator;
 
     /**
      * 대기 신청 업무 서비스를 주입받습니다.
      *
      * @param service 대기 신청 업무 서비스
+     * @param authorization Backend client의 서비스 소유권 정책
+     * @param coordinator Redis 장애 시 로컬 가용 상태를 차단하는 복구 coordinator
      */
-    public WaitingRoomController(WaitingRoomService service) {
+    public WaitingRoomController(WaitingRoomService service, WaitingClientAuthorization authorization,
+                                 WaitingRoomRecoveryCoordinator coordinator) {
         this.service = Objects.requireNonNull(service);
+        this.authorization = Objects.requireNonNull(authorization);
+        this.coordinator = Objects.requireNonNull(coordinator);
     }
 
     /**
@@ -52,13 +69,16 @@ public class WaitingRoomController {
      *
      * @param reservationRequestId 요청 식별자로 사용할 Idempotency-Key
      * @param request 대상 서비스와 redirect target
+     * @param authentication HTTP 요청의 인증 주체
      * @return 신규 등록은 201, 동일 요청 재전송은 200, payload 충돌은 409
      */
     @PostMapping("/waiting-requests")
     public ResponseEntity<?> create(
             @RequestHeader("Idempotency-Key") String reservationRequestId,
-            @Valid @RequestBody CreateWaitingRequest request
+            @Valid @RequestBody CreateWaitingRequest request,
+            Authentication authentication
     ) {
+        authorization.requireServiceOwnership(authentication, request.serviceId());
         var registration = service.register(
                 request.serviceId(),
                 reservationRequestId,
@@ -87,17 +107,15 @@ public class WaitingRoomController {
     /**
      * 현재 상태와 대기 순번을 조회하고 WAITING 요청의 heartbeat를 갱신합니다.
      *
-     * @param serviceId 대상 서비스 식별자
-     * @param reservationRequestId 대기 신청 식별자
+     * @param request same-origin 검증 대상 HTTP 요청
      * @return 현재 대기 상태와 다음 Polling 정보
      */
     @GetMapping("/waiting-session")
-    public WaitingStatusResponse status(
-            @RequestParam String serviceId,
-            @RequestParam String reservationRequestId
-    ) {
-        // 현재 핵심 기능 단계에서는 query parameter로 식별하며 보안 단계에서 세션 쿠키로 교체합니다.
-        var status = service.poll(serviceId, reservationRequestId);
+    public WaitingStatusResponse status(HttpServletRequest request) {
+        requireSameOrigin(request);
+        // MVC의 handler 인자 TRACE 로그에 비밀값이 출력되지 않도록 호출 내부에서 읽습니다.
+        var cookie = WebUtils.getCookie(request, "__Host-waiting_session");
+        var status = service.poll(cookie == null ? null : cookie.getValue());
         return new WaitingStatusResponse(
                 status.reservationRequestId(),
                 status.status(),
@@ -110,18 +128,83 @@ public class WaitingRoomController {
         );
     }
 
+    /** 일회용 토큰을 소비하고 브라우저의 최신 대기 세션 cookie를 발급합니다. */
+    @PostMapping("/waiting-session")
+    public ResponseEntity<Void> exchange(@RequestBody WaitingSessionRequest body, HttpServletRequest request) {
+        requireSameOrigin(request);
+        String cookie = service.exchangeToken(body.serviceId(), body.token());
+        return ResponseEntity.noContent().header("Set-Cookie", ResponseCookie.from("__Host-waiting_session", cookie)
+                .httpOnly(true).secure(true).sameSite("Strict").path("/").build().toString()).build();
+    }
+
+    /** 소유 서비스의 요청에 한해 이전 Browser 자격을 폐기하고 접근 URL을 재발급합니다. */
+    @PostMapping("/waiting-requests/{reservationRequestId}/access-tokens")
+    public ResponseEntity<?> issueToken(
+            @PathVariable String reservationRequestId, @RequestParam String serviceId, Authentication authentication
+    ) {
+        authorization.requireServiceOwnership(authentication, serviceId);
+        var registration = service.issueToken(serviceId, reservationRequestId);
+        if (registration.resultType() != RedisWaitingRoomStore.ResultType.APPLIED) {
+            return problem(HttpStatus.CONFLICT, "INVALID_STATE", "현재 요청 상태에서는 처리할 수 없습니다.", false);
+        }
+        return ResponseEntity.ok(new CreateWaitingResponse(
+                reservationRequestId, registration.status(), registration.waitingUrl()));
+    }
+
+    /** Browser 인증 실패에는 Backend의 Bearer challenge를 붙이지 않습니다. */
+    @ExceptionHandler(WaitingSessionInvalidException.class)
+    public ResponseEntity<ApiErrorResponse> invalidSession(WaitingSessionInvalidException exception) {
+        return problem(HttpStatus.UNAUTHORIZED, "WAITING_SESSION_INVALID", exception.getMessage(), false);
+    }
+
+    private void requireSameOrigin(HttpServletRequest request) {
+        if (!"1".equals(request.getHeader("X-Waiting-Request"))
+                || !"same-origin".equals(request.getHeader("Sec-Fetch-Site"))) {
+            throw new WaitingSessionInvalidException();
+        }
+        String origin = request.getHeader("Origin");
+        if (origin == null) return;
+        try {
+            URI uri = URI.create(origin);
+            int port = uri.getPort() == -1 ? ("https".equals(uri.getScheme()) ? 443 : 80) : uri.getPort();
+            if (!request.getScheme().equals(uri.getScheme()) || !request.getServerName().equals(uri.getHost())
+                    || request.getServerPort() != port || uri.getRawUserInfo() != null
+                    || uri.getRawQuery() != null || uri.getRawFragment() != null
+                    || !"".equals(uri.getRawPath())) {
+                throw new WaitingSessionInvalidException();
+            }
+        } catch (IllegalArgumentException exception) {
+            throw new WaitingSessionInvalidException();
+        }
+    }
+
+    /**
+     * 일회용 대기 토큰 교환 본문입니다.
+     * @param serviceId 토큰이 발급된 서비스
+     * @param token URL fragment에서 읽은 일회용 비밀값
+     */
+    public record WaitingSessionRequest(String serviceId, String token) {
+        @Override
+        public String toString() {
+            return "WaitingSessionRequest[redacted]";
+        }
+    }
+
     /**
      * 서비스 Backend가 입장 허용 요청의 실제 진입을 확인합니다.
      *
      * @param reservationRequestId 대기 신청 식별자
      * @param serviceId 대상 서비스 식별자
+     * @param authentication HTTP 요청의 인증 주체
      * @return 실제 입장 상태와 서비스 이용 만료시각
      */
     @PostMapping("/waiting-requests/{reservationRequestId}/enter")
     public ResponseEntity<?> enter(
             @PathVariable String reservationRequestId,
-            @RequestParam String serviceId
+            @RequestParam String serviceId,
+            Authentication authentication
     ) {
+        authorization.requireServiceOwnership(authentication, serviceId);
         return transitionResponse(service.enter(serviceId, reservationRequestId));
     }
 
@@ -130,13 +213,16 @@ public class WaitingRoomController {
      *
      * @param reservationRequestId 대기 신청 식별자
      * @param serviceId 대상 서비스 식별자
+     * @param authentication HTTP 요청의 인증 주체
      * @return 완료 처리 후 요청 상태
      */
     @PostMapping("/waiting-requests/{reservationRequestId}/complete")
     public ResponseEntity<?> complete(
             @PathVariable String reservationRequestId,
-            @RequestParam String serviceId
+            @RequestParam String serviceId,
+            Authentication authentication
     ) {
+        authorization.requireServiceOwnership(authentication, serviceId);
         return transitionResponse(service.complete(serviceId, reservationRequestId));
     }
 
@@ -145,13 +231,16 @@ public class WaitingRoomController {
      *
      * @param reservationRequestId 대기 신청 식별자
      * @param serviceId 대상 서비스 식별자
+     * @param authentication HTTP 요청의 인증 주체
      * @return 취소 처리 후 요청 상태
      */
     @PostMapping("/waiting-requests/{reservationRequestId}/cancel")
     public ResponseEntity<?> cancel(
             @PathVariable String reservationRequestId,
-            @RequestParam String serviceId
+            @RequestParam String serviceId,
+            Authentication authentication
     ) {
+        authorization.requireServiceOwnership(authentication, serviceId);
         return transitionResponse(service.cancel(serviceId, reservationRequestId));
     }
 
@@ -211,6 +300,22 @@ public class WaitingRoomController {
                 exception.getMessage(),
                 true
         );
+    }
+
+    /**
+     * Redis 연결·명령 장애를 내부 주소나 명령을 노출하지 않는 503 응답으로 변환합니다.
+     * 쓰기는 자동 재시도하지 않으며 호출자에게 짧은 재시도 간격만 안내합니다.
+     *
+     * @return 고정된 외부 메시지와 1초 Retry-After를 포함한 장애 응답
+     */
+    @ExceptionHandler({DataAccessException.class, WaitingRoomRecoveryCoordinator.UnavailableException.class,
+            RedisOperationalSafety.CapacityUnavailableException.class})
+    public ResponseEntity<ApiErrorResponse> dataAccessUnavailable(RuntimeException exception) {
+        if (exception instanceof DataAccessException) {
+            coordinator.markRedisUnavailable();
+        }
+        return problem(HttpStatus.SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE",
+                "서비스를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.", true, 1L);
     }
 
     /**
